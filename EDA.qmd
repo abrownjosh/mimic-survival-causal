@@ -1,0 +1,270 @@
+---
+title: "EDA"
+format: html
+editor: visual
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+```{r}
+1 + 1
+```
+
+You can add options to executable code like this
+
+```{r}
+#| echo: false
+2 * 2
+```
+
+The `echo: false` option disables the printing of code (only output is displayed).
+
+```{r}
+library(readr)
+library(tidyverse)
+chart = read_csv("chart_events_6_23.csv") 
+comorbid = read_csv("comorbidities_6_17.csv")
+proc = read_csv("procedures_6_16.csv")
+gcs = read_csv("gcs_6_17.csv")
+rx = read_csv("rx_6_17.csv")
+
+```
+
+```{r}
+chart.wide = chart %>% 
+  select( subject_id, hadm_id, gender, expire_flag,
+          # your baseline variables of interest go here!
+          # selected from chart
+          marital_status, label, valuenum, intervention.group) %>% 
+  pivot_wider(names_from = label, values_from = valuenum, values_fill = NA)
+```
+
+```{r}
+m <- lm(expire_flag~`Admit Wt`+`Admit Ht`, family = "binomial", data = chart.wide)
+summary(m)
+```
+
+```{r}
+chart.wide %>% ggplot(aes(y=expire_flag, x=`Admit Wt`)) + geom_point() + stat_smooth(method="glm", method.args = list(family = "binomial"), se = F)
+```
+
+```{r}
+library(dplyr)
+library(stringr)
+```
+
+```{r}
+
+# QUINN'S CODE FOR GETTING SINGLE PATIENT DATA WITH SURVIVAL TIME
+
+chart = chart %>% 
+  # mutate is a command used to create new variables in the piped in dataset
+  mutate(dischtime = parse_date_time(dischtime, orders = c("ymd HMS", "ymd")),
+         admittime = parse_date_time(admittime, orders = c("ymd HMS", "ymd")),
+         dob = parse_date_time(dob, orders = c( "ymd")),
+         dod = parse_date_time(dod, orders = c( "ymd")),
+         dod_hosp = parse_date_time(dod_hosp, orders = c("ymd")),
+         # Calculate age at admission in years
+         age.at.admit = as.numeric(difftime(admittime, dob, units = "days") / 365.25),
+         los = as.numeric(difftime(dischtime, admittime, units = "days")))
+
+
+### df which contains one entry per subject
+single_per_subject = chart %>% 
+  arrange(subject_id, desc(admittime)) %>% 
+  group_by(subject_id)%>%
+  ### slice will take the first entry--the first row
+  slice(1) %>% 
+  ungroup()
+
+
+### create column for if patient died or not
+### then keep only patients who were discharged
+single_per_subject = single_per_subject %>% 
+  ### adding a column to differentiate btw who died in hosp or nah
+  mutate(died_in_hosp = !is.na(dod_hosp)) %>% 
+  ### only keeping those who were discharged
+  filter(!died_in_hosp) 
+
+
+### calculating survival time for all discharged patients
+single_per_subject = single_per_subject %>% 
+  mutate(
+    ### cals dif btw discharge and death if died
+    survival_days = as.numeric(difftime(dod, dischtime, units = "days")),
+    ### if dod is NA, we are assuming they are still alived and cap them at 90days
+    survival_days = ifelse(is.na(survival_days), 90, pmin(survival_days, 90)),
+       )
+
+### checking to see if this is working / looks right
+#single_per_subject %>% 
+#  dplyr::select(subject_id, survival_days) %>% 
+#  View()
+
+```
+
+
+```{r}
+# HANRUI'S CODE FOR ENSURING THERE ARE NO NA DIAGNOSES
+
+diag_dict <- read_csv("diag_dict.csv",
+                      col_types = cols(
+                        diagnosis_raw       = col_character(),
+                        diagnose_big_class  = col_character()
+                      ))
+
+diag_group <- single_per_subject %>%
+  dplyr::select(subject_id, diagnosis) %>%
+  separate_rows(diagnosis, sep = "\\s*[;,]\\s*") %>%
+  mutate(diagnosis = str_trim(str_to_upper(diagnosis))) %>%
+  left_join(diag_dict, by = c("diagnosis" = "diagnosis_raw"))
+
+# check if there are unmatched diagnosis
+unmatched <- diag_group %>%
+  filter(is.na(diagnose_big_class) & !is.na(diagnosis) & diagnosis != "") %>%
+  distinct(diagnosis)
+
+# view(unmatched)
+diag_group <- diag_group%>%
+  dplyr::select(subject_id, diagnose_big_class)%>%
+  distinct()
+
+# Assigning the group back to the big dataframe
+single_per_subject = single_per_subject %>% left_join(diag_group, by="subject_id", .keep_all)
+```
+
+```{r}
+
+### DIAGNOSES CATEGORIZATION
+
+# Run diag_catories.R ahead of time to get the environment variable of "diag_categories"
+
+# Mapping from diagnosis to category of diagnosis (11 total categories)
+#diag_to_cat <- unlist(lapply(names(diag_categories), function(cat) {
+#  setNames(rep(cat, length(diag_categories[[cat]])), diag_categories[[cat]])
+#}))
+
+# Does the mapping on the diagnoses
+#single_per_subject$diag_cat <- diag_to_cat[single_per_subject$diagnosis]
+
+# If the diagnosis is "NA", assigns "Other / Unclassified"
+#single_per_subject$diag_cat <- ifelse(is.na(single_per_subject$diag_cat), "Other / Unclassified", single_per_subject$diag_cat)
+```
+
+```{r}
+### DRUG CATEGORIZATION
+
+# Mapping from drug to category of drug (28 total categories)
+drug_to_category <- unlist(lapply(names(drug_categories), function(cat) {
+  setNames(rep(cat, length(drug_categories[[cat]])), drug_categories[[cat]])
+}))
+
+# Makes the drug category column in the rx dataframe
+rx$drug_cat <- drug_to_category[rx$drug]
+
+# For any drugs not found in the mapping (NA), assign "Uncategorized"
+rx$drug_cat <- ifelse(is.na(rx$drug_cat), "Uncategorized", rx$drug_cat)
+
+# Collapses all of the drugs taken by a patient into one row. Without this, you might have a lot of entries of different drugs all taken by one patient.
+rx_collapsed <- rx %>%
+  group_by(subject_id) %>%
+  summarize(drug_cat_list = paste(drug_cat, collapse = ", "), .groups = "drop", formulary_drug_cd_list = paste(formulary_drug_cd, collapse=", "))
+
+# Removes duplicates (if the patient takes multiple drugs with the same classification, ensures that classification only appears once in the list)
+rx_collapsed <- rx_collapsed %>%
+  mutate(
+    drug_cat_list = map_chr(drug_cat_list, ~ {
+      
+      # Splits the string into a vector, trims whitespaces
+      drugs <- str_trim(str_split(.x, ",")[[1]])
+      
+      # Removes duplicates (still keeps the order)
+      drugs_unique <- unique(drugs)
+      
+      # Recombines the list into one string
+      paste(drugs_unique, collapse = ", ")
+    })
+  ) %>% mutate(
+    formulary_drug_cd_list = map_chr(formulary_drug_cd_list, ~ {
+      
+      # Splits the string into a vector, trims whitespaces
+      drugs <- str_trim(str_split(.x, ",")[[1]])
+      
+      # Removes duplicates (still keeps the order)
+      drugs_unique <- unique(drugs)
+      
+      # Recombines the list into one string
+      paste(drugs_unique, collapse = ", ")
+    })
+  ) 
+
+# Assigns each patient's drug list (if available) to its entry in the big data frame (single_per_subject)
+single_per_subject <- single_per_subject %>%
+  left_join(rx_collapsed %>% dplyr::select(subject_id, drug_cat_list, formulary_drug_cd_list), by = "subject_id", .keep_all )
+
+
+```
+
+
+```{r}
+
+# Start with your code to get most recent entries
+result <- gcs %>%
+  group_by(subject_id, label) %>%
+  arrange(desc(charttime), .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup()
+
+# Now pivot to wide format with separate columns for each GCS component
+gcs_wide <- result %>%
+  select(subject_id, label, value) %>%  # Keep only needed columns
+  pivot_wider(
+    names_from = label,
+    values_from = value,
+    names_prefix = "GCS_"
+  )
+
+# Clean up column names (optional but recommended)
+names(gcs_wide) <- names(gcs_wide) %>%
+  gsub("GCS - ", "", .) %>%       # Remove "GCS - " prefix
+  gsub(" ", "_", .) %>%           # Replace spaces with underscores
+  gsub("GCS_GCS_Total", "GCS_Total", .) # Keep "GCS_Total" consistent
+
+gcs_wide = gcs_wide %>% mutate(GCS_Total = as.numeric(GCS_Total))
+
+single_per_subject = single_per_subject %>% left_join(gcs_wide, by="subject_id")
+
+```
+
+```{r}
+
+single_per_subject %>% filter(diagnose_big_class %in% selected_classes) %>% ggplot(aes(x=GCS_Total, y=survival_days, color=diagnose_big_class)) + geom_jitter(width = 0.1, na.rm = T)
+
+```
+```{r}
+
+selected_classes <- c("H5 Parenchymal ICH", "I1 Ischemic/TIA", 
+                     "S1 Systemic", "H6 ICH Unspecified")
+
+single_per_subject %>%
+  filter(!is.na(GCS_Total), !is.na(survival_days), diagnose_big_class %in% selected_classes) %>%
+  group_by(GCS_Total, diagnose_big_class) %>%
+  summarize(mean_survival = mean(survival_days)) %>%
+  ggplot(aes(x = factor(GCS_Total), y = diagnose_big_class, 
+             fill = mean_survival)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "maroon", high = "darkgreen", name = "Mean Survival Days") +
+  labs(title = "Mean Survival Days by GCS and Diagnosis Group",
+       x = "Glasgow Coma Scale (Total)",
+       y = "Diagnosis Group") +
+  theme_minimal() + theme(legend.position = "none") +
+  geom_text(aes(label = round(mean_survival, 1)), color = "white")
+
+```
+
