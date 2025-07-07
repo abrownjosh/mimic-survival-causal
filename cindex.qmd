@@ -17,9 +17,13 @@ library(survival)
 library(dplyr)
 library(randomForestSRC)
 library(survAUC) # concordance index
+
 ```
 
+## Initial Filtering - Dropping Identifying/"Unsure" Columns
+
 ```{r}
+
 sps <- fread("../data/sps.csv")
 
 # Drop unwanted columns
@@ -39,49 +43,49 @@ sps[, (drop_cols) := NULL]
 sps <- sps[!is.na(age.at.admit)]
 
 
-# One-hot encode
+
+```
+
+## Grouping Ethnicity (Eliana's Code)
+
+```{r}
+# ELIANA'S SPS MERGE CODE
+sps <- sps %>% mutate(ethnicity = case_when(
+    str_detect(ethnicity, regex("ASIAN", ignore_case = TRUE)) ~ "Asian",
+    str_detect(ethnicity, regex("WHITE|MIDDLE", ignore_case = TRUE)) ~ "White",
+    str_detect(ethnicity, regex("BLACK", ignore_case = TRUE)) ~ "Black or African American",
+    str_detect(ethnicity, regex("OTHER|PATIENT|UNABLE|UNKNOWN", ignore_case = TRUE)) ~ "Unknown",
+    str_detect(ethnicity, regex("AMERICAN", ignore_case = TRUE)) ~ "American Indian or Alaska Native",
+    str_detect(ethnicity, regex("HISPANIC", ignore_case = TRUE)) ~ "Hispanic",
+    str_detect(ethnicity, regex("MULTI", ignore_case = TRUE)) ~ "More than one race",
+    TRUE ~ ethnicity
+  ))
+```
+
+## One Hot Encoding for Categorical Variables
+
+```{r}
+# categorical variables
 cat_vars <- c("gender", "admission_type", "insurance", "religion", "marital_status", "ethnicity", "discharge_location", "intervention.group")
 
 
-
-# One-hot encode categorical variables
+# one-hot encode the categorical variables
 mm <- model.matrix(~ . - 1, data = sps[, ..cat_vars])
 
-# Remove duplicate column names if any
-mm <- mm[, !duplicated(colnames(mm))]
-
-# Combine with rest of dataset
+# combining back with the rest of dataset
 sps <- cbind(sps[, !cat_vars, with = FALSE], as.data.table(mm))
+```
 
-# FIX HERE
-#sps <- as.data.table(model.matrix(~ . - 1, data = sps, subset = cat_vars))[, .SD, .SDcols = !duplicated(names(.SD))]
-
-sps <- cbind(sps, sps[, !names(sps) %in% cat_vars, with = FALSE])
-
-# Ethnicity merging (logical -> numeric)
-sps[, ethnicityWHITE := +(`ethnicityWHITE` + `ethnicityWHITE - BRAZILIAN` + `ethnicityWHITE - OTHER EUROPEAN` + `ethnicityWHITE - RUSSIAN` + `ethnicityMIDDLE EASTERN` > 0)]
-
-sps[, ethnicityBLACK := +(`ethnicityBLACK/AFRICAN AMERICAN` + `ethnicityBLACK/CAPE VERDEAN` + `ethnicityBLACK/HAITIAN` > 0)]
-
-sps[, ethnicityHISPANICLATINO := +(`ethnicityHISPANIC OR LATINO` + `ethnicityHISPANIC/LATINO - COLOMBIAN` + `ethnicityHISPANIC/LATINO - DOMINICAN` + `ethnicityHISPANIC/LATINO - PUERTO RICAN` > 0)]
-
-sps[, ethnicityASIAN := +(rowSums(.SD) > 0), .SDcols = patterns("ethnicityASIAN")]
-
-sps[, ethnicityOTHER := +(`ethnicityMULTI RACE ETHNICITY` + ethnicityOTHER > 0)]
-
-sps[, ethnicityUNKNOWN := +(`ethnicityPATIENT DECLINED TO ANSWER` + `ethnicityUNABLE TO OBTAIN` + `ethnicityUNKNOWN/NOT SPECIFIED` > 0)]
-
-# Drop raw ethnicity columns
-sps <- sps[, !grepl("ethnicity", names(sps)) | names(sps) %in% c("ethnicityWHITE", "ethnicityBLACK", "ethnicityHISPANIC_LATINO", "ethnicityASIAN", "ethnicityOTHER", "ethnicityUNKNOWN"), with = FALSE]
-
-# Filter out zero survival
-sps <- sps[survival_days > 0]
+```{r}
+# filter out zero survival
+sps <- sps[survival_days >= 0]
 
 # Binary target
-sps[, survived_90 := survival_days > 90]
+sps[, survived_90 := survival_days >= 90]
 
 # Fill NAs
-sps[is.na(sps)] <- 0
+cols_to_fill <- setdiff(names(sps), c("age.at.admit", "gcs_total"))
+sps[, (cols_to_fill) := lapply(.SD, function(x) ifelse(is.na(x), 0, x)), .SDcols = cols_to_fill]
 
 # Remove ID columns
 X <- sps[, !c("subject_id", "survival_days", "survived_90", "event"), with = FALSE]
@@ -89,21 +93,6 @@ y <- sps[, .(time = survival_days, status = as.integer(event))]
 
 # Combine for mlr3 task
 data <- cbind(X, y)
-
-
-```
-
-```{r}
-#mutate(ethnicity = case_when(
-#    str_detect(ethnicity, regex("ASIAN", ignore_case = TRUE)) ~ "Asian",
-#    str_detect(ethnicity, regex("WHITE|MIDDLE", ignore_case = TRUE)) ~ "White",
-#    str_detect(ethnicity, regex("BLACK", ignore_case = TRUE)) ~ "Black or African #American",
-#    str_detect(ethnicity, regex("OTHER|PATIENT|UNABLE|UNKNOWN", ignore_case = TRUE#)) ~ "Unknown",
-#    str_detect(ethnicity, regex("AMERICAN", ignore_case = TRUE)) ~ "American Indian #or Alaska Native",
-#    str_detect(ethnicity, regex("HISPANIC", ignore_case = TRUE)) ~ "Hispanic#/Latino",
-#    str_detect(ethnicity, regex("MULTI", ignore_case = TRUE)) ~ "More than one #race",
-#    TRUE ~ "Unknown"
-#  ))
 ```
 
 ```{r}
@@ -115,7 +104,7 @@ sps <- sps %>% dplyr::filter(!is.na(event), !is.na(survival_days))
 
 # Train/test split
 set.seed(7)
-train_idx <- sample(seq_len(nrow(sps)), size = 0.8 * nrow(sps))
+train_idx <- sample(seq_len(nrow(sps)), size = 0.5 * nrow(sps))
 train_data <- sps[train_idx, ]
 test_data <- sps[-train_idx, ]
 
@@ -147,7 +136,7 @@ risk_scores <- 1 - rsf_pred$survival[, ncol(rsf_pred$survival)]
 rsf_pred <- predict(rsf_model, newdata = test_data)
 rsf_cindex <- randomForestSRC::get.cindex(time = test_data$survival_days,
                                censoring = test_data$event,
-                               predicted = rsf_pred$predicted)
+                               predicted = -rsf_pred$predicted)
 print(paste("RSF C-index:", round(rsf_cindex, 3)))
 
 
@@ -155,6 +144,9 @@ print(paste("RSF C-index:", round(rsf_cindex, 3)))
 
 ```{r}
 gbm_concordance <- concordance(y_test ~ gbm_pred)
+if (gbm_concordance$concordance < 0.5) {
+  gbm_concordance$concordance <- 1 - gbm_concordance$concordance
+}
 print(paste("GBM C-index:", round(gbm_concordance$concordance, 3)))
 ```
 
@@ -176,4 +168,26 @@ for (i in 1:5) {
     cat(sprintf("  P(survival > %d days) = %.3f\n", time_points[j], surv_probs[j]))
   }
 }
+```
+
+```{r}
+gbm_cindex <- Hmisc::rcorr.cens(
+  x = -gbm_pred,  # Note the negative sign to ensure proper risk direction
+  S = y_test
+)["C Index"]
+print(paste("GBM C-index (Hmisc):", round(gbm_cindex, 3)))
+```
+
+```{r}
+rcorr.cens # CORRELATION COEFFICIENT FOR CENSORED DATA
+```
+
+# permutation test
+
+## ranger, run random forest, nperm = \> 100, Altmann version, try janitza if it doesn't run
+
+## try getting graph with p values / z scores of each covariate
+
+```{r}
+
 ```
