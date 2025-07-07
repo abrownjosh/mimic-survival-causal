@@ -1,0 +1,168 @@
+---
+title: "initial_processing"
+format: html
+editor: visual
+---
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(pROC)
+library(ROCR)
+library(data.table)
+library(ggplot2)
+library(forcats)
+library(here)
+library(ranger)
+```
+
+```{r}
+sps <- fread(here("../data", "sps.csv"))
+
+# Drop unnecessary columns
+drop_cols <- c('dbsource', 'formulary_drug_cd_list', 'admission_location', 'admittime', 'dischtime', 'edregtime', 'edouttime', 'diagnosis', 'latest_gcs_time', 'comorbidities', 'proc.icd9_list', 'gcs_verbal', 'gcs_motor', 'gcs_eye', 'language', 'drug.Miscellaneous', 'diag.Missing', 'gcs_total')
+
+sps <- sps[, !..drop_cols, with = FALSE]
+
+sps
+
+# Drop rows with missing age
+sps <- sps[!is.na(age.at.admit)]
+
+# One-hot encode selected categorical columns
+sps <- sps %>%
+  mutate(across(c(gender, admission_type, insurance, religion, marital_status, ethnicity, discharge_location, intervention.group), as.factor)) %>%
+  fastDummies::dummy_cols(remove_first_dummy = FALSE, remove_selected_columns = TRUE)
+```
+
++---------+--------------+-----------------+-----------------+---+
+| \       | age.at.admit | admittime       | dischtime       |   |
+| gender  |              |                 |                 |   |
+|         | \<dbl\>      | \<S3: POSIXct\> | \<S3: POSIXct\> |   |
+| \<chr\> |              |                 |                 |   |
++:========+=============:+================:+================:+===+
+|         |              |                 |                 |   |
++---------+--------------+-----------------+-----------------+---+
+
+```{r}
+# Group ethnicity columns
+ethnicity_groups <- list(
+  ethnicity_WHITE = c("ethnicity_WHITE", "ethnicity_WHITE - BRAZILIAN", "ethnicity_WHITE - OTHER EUROPEAN", "ethnicity_WHITE - RUSSIAN", "ethnicity_MIDDLE EASTERN"),
+  ethnicity_BLACK = c("ethnicity_BLACK/AFRICAN AMERICAN", "ethnicity_BLACK/CAPE VERDEAN", "ethnicity_BLACK/HAITIAN"),
+  ethnicity_HISPANIC_LATINO = c("ethnicity_HISPANIC OR LATINO", "ethnicity_HISPANIC/LATINO - COLOMBIAN", "ethnicity_HISPANIC/LATINO - DOMINICAN", "ethnicity_HISPANIC/LATINO - PUERTO RICAN"),
+  ethnicity_ASIAN = c("ethnicity_ASIAN", "ethnicity_ASIAN - ASIAN INDIAN", "ethnicity_ASIAN - CAMBODIAN", "ethnicity_ASIAN - CHINESE", "ethnicity_ASIAN - JAPANESE", "ethnicity_ASIAN - OTHER", "ethnicity_ASIAN - VIETNAMESE"),
+  ethnicity_OTHER = c("ethnicity_AMERICAN INDIAN/ALASKA NATIVE", "ethnicity_MULTI RACE ETHNICITY", "ethnicity_OTHER"),
+  ethnicity_UNKNOWN = c("ethnicity_PATIENT DECLINED TO ANSWER", "ethnicity_UNABLE TO OBTAIN", "ethnicity_UNKNOWN/NOT SPECIFIED")
+)
+
+for (new_col in names(ethnicity_groups)) {
+  cols <- ethnicity_groups[[new_col]]
+  sps[[new_col]] <- rowSums(sps[, ..cols], na.rm = TRUE) > 0
+}
+
+# Remove original ethnicity columns
+eth_cols_to_remove <- unlist(ethnicity_groups)
+sps <- sps[, !(names(sps) %in% eth_cols_to_remove), with = FALSE]
+
+# Create binary target
+sps$survived_90 <- sps$survival_days > 90
+```
+
+```{r}
+# Fill NA with 0
+sps[is.na(sps)] <- 0
+
+# Set up data
+X <- sps %>%
+  select(-subject_id, -survival_days, -survived_90, -event)
+
+y <- as.factor(sps$survived_90)
+
+train_data <- cbind(X, survived_90 = y)
+
+# Split train/test
+set.seed(7)
+train_index <- createDataPartition(y, p = 0.8, list = FALSE)
+train_set <- train_data[train_index, ]
+test_set <- train_data[-train_index, ]
+
+colnames(train_set) <- make.names(colnames(train_set), unique = TRUE)
+
+rf_model <- ranger(
+  formula = survived_90 ~ ., 
+  data = train_set,
+  probability = TRUE,        # needed for ROC/probabilities
+  importance = "impurity",   # or "permutation"
+  num.trees = 100,
+  mtry = floor(sqrt(ncol(X))),
+  min.node.size = 1,
+  seed = 713
+)
+```
+
+```{r}
+# Convert all logical columns in X_train and X_test to numeric
+X_train[] <- lapply(X_train, function(col) {
+  if (is.logical(col)) as.numeric(col) else col
+})
+
+X_test[] <- lapply(X_test, function(col) {
+  if (is.logical(col)) as.numeric(col) else col
+})
+
+```
+
+```{r}
+set.seed(7)
+gb_model <- train(x = X_train, y = y_train,
+                  method = "gbm",
+                  trControl = trainControl(method = "none"),
+                  verbose = FALSE)
+
+# Predictions
+y_pred <- predict(gb_model, X_test)
+y_prob <- predict(gb_model, X_test, type = "prob")[, 2]
+
+# Evaluation Metrics
+conf_mat <- confusionMatrix(y_pred, y_test)
+print(conf_mat)
+
+# Classification Metrics Plot
+metrics_df <- tibble(
+  Metric = c("Accuracy", "Precision", "Recall", "F1"),
+  Score = c(conf_mat$overall["Accuracy"],
+            conf_mat$byClass["Precision"],
+            conf_mat$byClass["Recall"],
+            conf_mat$byClass["F1"])
+)
+
+```
+
+```{r}
+ggplot(metrics_df, aes(x = Metric, y = Score, fill = Metric)) +
+  geom_col(show.legend = FALSE) +
+  geom_text(aes(label = sprintf("%.3f", Score)), vjust = -0.3) +
+  ylim(0, 1) +
+  ggtitle("Model Evaluation Metrics") +
+  theme_minimal()
+
+# Confusion Matrix Heatmap
+cm <- as.table(conf_mat$table)
+cm_df <- as.data.frame(cm)
+ggplot(cm_df, aes(x = Prediction, y = Reference, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), size = 10) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  labs(title = "Confusion Matrix")
+
+# ROC Curve
+roc_obj <- roc(as.numeric(y_test), y_prob)
+plot(roc_obj, col = "darkorange", main = sprintf("ROC Curve (AUC = %.2f)", auc(roc_obj)))
+
+# Precision-Recall Curve
+pr <- PRROC::pr.curve(scores.class0 = y_prob, weights.class0 = as.numeric(y_test) - 1)
+plot(pr)
+```
