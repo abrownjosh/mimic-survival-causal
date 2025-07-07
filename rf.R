@@ -1,10 +1,4 @@
----
-title: "initial_processing"
-format: html
-editor: visual
----
-
-```{r}
+## ---------------------------------------------------------------------------------------------------------------------------
 # Load libraries
 library(tidyverse)
 library(caret)
@@ -18,9 +12,9 @@ library(forcats)
 library(here)
 library(ranger)
 library(dplyr)
-```
 
-```{r}
+
+## ---------------------------------------------------------------------------------------------------------------------------
 sps <- fread(here("../data", "sps.csv"))
 
 # Drop unnecessary columns
@@ -35,9 +29,9 @@ sps <- sps[!is.na(age.at.admit)]
 sps <- sps %>%
   mutate(across(c(gender, admission_type, insurance, religion, marital_status, ethnicity, discharge_location, intervention.group), as.factor)) %>%
   fastDummies::dummy_cols(remove_first_dummy = FALSE, remove_selected_columns = TRUE)
-```
 
-```{r}
+
+## ---------------------------------------------------------------------------------------------------------------------------
 # Group ethnicity columns
 ethnicity_groups <- list(
   ethnicity_WHITE = c("ethnicity_WHITE", "ethnicity_WHITE - BRAZILIAN", "ethnicity_WHITE - OTHER EUROPEAN", "ethnicity_WHITE - RUSSIAN", "ethnicity_MIDDLE EASTERN"),
@@ -59,9 +53,9 @@ sps <- sps[, !(names(sps) %in% eth_cols_to_remove), with = FALSE]
 
 # Create binary target
 sps$survived_90 <- sps$survival_days > 90
-```
 
-```{r}
+
+## ---------------------------------------------------------------------------------------------------------------------------
 # Fill NA with 0
 # sps[is.na(sps)] <- 0
 
@@ -107,9 +101,9 @@ rf_model <- ranger(
   seed = 713
 )
 
-```
 
-```{r}
+
+## ---------------------------------------------------------------------------------------------------------------------------
 # Convert all logical columns in X_train and X_test to numeric
 X_train[] <- lapply(X_train, function(col) {
   if (is.logical(col)) as.numeric(col) else col
@@ -119,9 +113,9 @@ X_test[] <- lapply(X_test, function(col) {
   if (is.logical(col)) as.numeric(col) else col
 })
 
-```
 
-```{r}
+
+## ---------------------------------------------------------------------------------------------------------------------------
 set.seed(7)
 gb_model <- train(x = X_train, y = y_train,
                   method = "gbm",
@@ -145,9 +139,9 @@ metrics_df <- tibble(
             conf_mat$byClass["F1"])
 )
 
-```
 
-```{r}
+
+## ---------------------------------------------------------------------------------------------------------------------------
 ggplot(metrics_df, aes(x = Metric, y = Score, fill = Metric)) +
   geom_col(show.legend = FALSE) +
   geom_text(aes(label = sprintf("%.3f", Score)), vjust = -0.3) +
@@ -171,8 +165,8 @@ plot(roc_obj, col = "darkorange", main = sprintf("ROC Curve (AUC = %.2f)", auc(r
 # Precision-Recall Curve
 pr <- PRROC::pr.curve(scores.class0 = y_prob, weights.class0 = as.numeric(y_test) - 1, curve=TRUE)
 plot(pr)
-```
 
-```{r}
+
+## ---------------------------------------------------------------------------------------------------------------------------
 knitr::purl("rf.qmd", output = "rf.R")
-```
+
