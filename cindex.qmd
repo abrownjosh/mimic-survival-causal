@@ -17,30 +17,79 @@ library(survival)
 library(dplyr)
 library(randomForestSRC)
 library(survAUC) # concordance index
-
+library(stringr)
+library(mice)
+library(ranger)
 ```
 
-## Initial Filtering - Dropping Identifying/"Unsure" Columns
+## Reading Merged_V4 (from end of 7/7) and running the data imputation. This does NOT impute survival times, but it DOES impute age.at.admit and gcs_total.
+
+```{r}
+sps <- fread("../data/merged_v4.csv")
+
+sps <- sps %>% select(-1)
+sps <- sps %>% mutate(across(where(is.character), factor))
+met <- make.method(sps)
+met["age.at.admit"] <- "pmm"
+met["gcs_total"]    <- "pmm"
+multicat <- c("admission_type", "admission_location", "discharge_location",
+              "insurance", "language", "religion",
+              "marital_status", "ethnicity")
+# use random forest for imputation
+met[multicat] <- "cart"
+# not imputed data
+met[c("subject_id", "survival_days", "event")] <- ""
+# ───────────────────────────────────────────────────────────
+# 3. predictorMatrix：
+# ───────────────────────────────────────────────────────────
+pred <- make.predictorMatrix(sps)
+pred[ , c("subject_id", "survival_days", "event",
+          grep("^PO_", names(sps), value = TRUE))] <- 0   # excluded from predictors
+# ───────────────────────────────────────────────────────────
+# 4. mice
+# ───────────────────────────────────────────────────────────
+set.seed(2025)
+imp <- mice(sps,
+            m                  = 5,
+            method             = met,
+            predictorMatrix    = pred,
+            maxit              = 20,
+            printFlag          = TRUE)
+```
+
+### Storing the imputation results in sps_imputed.csv
+
+```{r}
+write.csv(imp$data, "sps_imputed.csv", row.names = FALSE)
+```
+
+## START FROM HERE TO NOT DO IMPUTATION
+
+## Imports imputed dataset and removes pseudoobservation entries (they are not interpretable but are developed based on the outcome, so it's unfair to train off of them).
 
 ```{r}
 
-sps <- fread("../data/sps.csv")
+# MERGED V4 = PRE IMPUTATION
+sps <- fread("../data/sps_imputed.csv")
+
+# removing predictor matrices? (ask about this)
+sps <- sps %>% select(-starts_with("PO_"))
 
 # Drop unwanted columns
-drop_cols <- c(
-  # we want to drop these
-  "dbsource", "formulary_drug_cd_list", "admission_location", "admittime", "dischtime",
-  "edregtime", "edouttime", "diagnosis", "latest_gcs_time", "comorbidities", "proc.icd9_list",
-  
-  # dropping but not sure how to handle yet
-  "gcs_total", "gcs_verbal", "gcs_motor", "gcs_eye", "language", "drug.Miscellaneous", "diag.Missing"
-)
+#drop_cols <- c(
+#  # we want to drop these
+#  "dbsource", "formulary_drug_cd_list", "admission_location", "admittime", #"dischtime",
+#  "edregtime", "edouttime", "diagnosis", "latest_gcs_time", "comorbidities", "proc#.icd9_list",
+#  
+#  # dropping but not sure how to handle yet
+#  "gcs_total", "gcs_verbal", "gcs_motor", "gcs_eye", "language", "drug#.Miscellaneous", "diag.Missing"
+#)
 
 # dropping those columns
-sps[, (drop_cols) := NULL]
+#sps[, (drop_cols) := NULL]
 
 # drop patients with missing age (until we figure out what imputation we're doing)
-sps <- sps[!is.na(age.at.admit)]
+#sps <- sps[!is.na(age.at.admit)]
 
 
 
@@ -66,7 +115,7 @@ sps <- sps %>% mutate(ethnicity = case_when(
 
 ```{r}
 # categorical variables
-cat_vars <- c("gender", "admission_type", "insurance", "religion", "marital_status", "ethnicity", "discharge_location", "intervention.group")
+cat_vars <- c("gender", "admission_type", "insurance", "religion", "marital_status", "ethnicity", "discharge_location", "intervention.group", "language")
 
 
 # one-hot encode the categorical variables
@@ -76,79 +125,175 @@ mm <- model.matrix(~ . - 1, data = sps[, ..cat_vars])
 sps <- cbind(sps[, !cat_vars, with = FALSE], as.data.table(mm))
 ```
 
+## ignorable: some extra filtering that is no longer necessary
+
 ```{r}
 # filter out zero survival
-sps <- sps[survival_days >= 0]
+#sps <- sps[survival_days >= 0]
 
 # Binary target
-sps[, survived_90 := survival_days >= 90]
+#sps[, survived_90 := survival_days >= 90]
 
 # Fill NAs
-cols_to_fill <- setdiff(names(sps), c("age.at.admit", "gcs_total"))
-sps[, (cols_to_fill) := lapply(.SD, function(x) ifelse(is.na(x), 0, x)), .SDcols = cols_to_fill]
+#cols_to_fill <- setdiff(names(sps), c("age.at.admit", "gcs_total"))
+#sps[, (cols_to_fill) := lapply(.SD, function(x) ifelse(is.na(x), 0, x)), .SDcols = #cols_to_fill]
 
 # Remove ID columns
-X <- sps[, !c("subject_id", "survival_days", "survived_90", "event"), with = FALSE]
-y <- sps[, .(time = survival_days, status = as.integer(event))]
+#X <- sps[, !c("subject_id", "survival_days", "survived_90", "event"), with = FALSE]
+#y <- sps[, .(time = survival_days, status = as.integer(event))]
 
 # Combine for mlr3 task
-data <- cbind(X, y)
+#data <- cbind(X, y)
 ```
+
+## splitting into train/test, building RSF and GBM models and getting their predictions
 
 ```{r}
 
-sps <- sps[, !duplicated(names(sps)), with = FALSE]
+#sps <- sps[, !duplicated(names(sps)), with = FALSE]
 
 # Prepare survival object
-sps <- sps %>% dplyr::filter(!is.na(event), !is.na(survival_days))
+#sps <- sps %>% dplyr::filter(!is.na(event), !is.na(survival_days))
 
 # Train/test split
 set.seed(7)
-train_idx <- sample(seq_len(nrow(sps)), size = 0.5 * nrow(sps))
+train_idx <- sample(seq_len(nrow(sps)), size = 0.6 * nrow(sps))
 train_data <- sps[train_idx, ]
 test_data <- sps[-train_idx, ]
 
+train_data_clean <- train_data %>%
+  select(-subject_id) %>%
+  mutate(across(where(is.character), as.factor))
+
+test_data_clean <- test_data %>%
+  select(-subject_id) %>%
+  mutate(across(where(is.character), as.factor))
+
+train_data_clean <- train_data_clean %>% filter(complete.cases(.))
+test_data_clean <- test_data_clean %>% filter(complete.cases(.))
+
 # fit random survival forest
-rsf_model <- rfsrc(Surv(survival_days, event) ~ ., data = train_data %>% select(-subject_id, -survived_90))
+rsf_model <- rfsrc(Surv(survival_days, event) ~ ., data = train_data_clean)
 
 # fit gradient boosting model (Cox PH boosting)
 library(gbm)
 gbm_model <- gbm(Surv(survival_days, event) ~ ., 
-                 data = train_data %>% select(-subject_id, -survived_90),
+                 data = train_data_clean,
                  distribution = "coxph",
                  n.trees = 100)
 
-rsf_pred <- predict(rsf_model, newdata = test_data)
+rsf_pred <- predict(rsf_model, newdata = test_data_clean)
 
-gbm_pred <- predict(gbm_model, newdata = test_data %>% select(-subject_id, -survived_90), n.trees = 100)
+gbm_pred <- predict(gbm_model, newdata = test_data_clean, n.trees = 100)
 
 
 ```
 
+## C-Index of RSF
+
 ```{r}
-y_test <- Surv(test_data$survival_days, test_data$event)
+y_test <- Surv(test_data_clean$survival_days, test_data_clean$event)
 
 # risk score supposedly can be approximated as 1 - predicted survival probability at a fixed time (e.g., median), or use predicted mortality (1 - survival) at last time point
 
 # risk score: 1 - survival probability at max time point predicted
 risk_scores <- 1 - rsf_pred$survival[, ncol(rsf_pred$survival)]
 
-rsf_pred <- predict(rsf_model, newdata = test_data)
-rsf_cindex <- randomForestSRC::get.cindex(time = test_data$survival_days,
-                               censoring = test_data$event,
+rsf_pred <- predict(rsf_model, newdata = test_data_clean)
+
+rsf_cindex <- randomForestSRC::get.cindex(time = test_data_clean$survival_days,
+                               censoring = test_data_clean$event,
                                predicted = -rsf_pred$predicted)
 print(paste("RSF C-index:", round(rsf_cindex, 3)))
 
 
 ```
 
+## IBS Score for RSF
+
+```{r}
+# Get predicted survival probabilities from RSF
+rsf_pred <- predict(rsf_model, newdata = test_data_clean, importance = FALSE)
+
+# Extract survival probabilities at observed time points
+rsf_surv_probs <- rsf_pred$survival  # Matrix: rows = test samples, cols = time points
+times <- rsf_pred$time.interest      # Time points at which survival is estimated
+
+# Compute Brier score & IBS
+brier_rsf <- riskRegression::Score(
+  list("RSF" = rsf_surv_probs),
+  formula = Surv(survival_days, event) ~ 1,
+  data = test_data_clean,
+  times = times,
+  summary = "ibs",
+  cens.model = "km"  # Method for handling censoring
+)
+
+# Extract IBS
+ibs_rsf <- brier_rsf$Brier$score[brier_rsf$Brier$score$model == "RSF", "IBS"]
+print(paste("RSF IBS:", ibs_rsf))
+
+time_points <- rsf_pred$time.interest     # Corresponding time points
+
+# Approximate IBS (trapezoidal rule for integration)
+ibs_rsf <- sum(diff(time_points) * (ibs_rsf[-1] + ibs_rsf[-length(ibs_rsf)])) / 2 / max(time_points)
+print(paste("Approximate RSF IBS:", ibs_rsf))
+```
+
+## C-Index of GBM
+
 ```{r}
 gbm_concordance <- concordance(y_test ~ gbm_pred)
 if (gbm_concordance$concordance < 0.5) {
   gbm_concordance$concordance <- 1 - gbm_concordance$concordance
 }
+
 print(paste("GBM C-index:", round(gbm_concordance$concordance, 3)))
+
+## ADDITIONAL CODE THAT GETS THE SAME THING ###
+'''
+{r}
+gbm_cindex <- Hmisc::rcorr.cens(
+  x = -gbm_pred,  # Note the negative sign to ensure proper risk direction
+  S = y_test
+)["C Index"]
+print(paste("GBM C-index (Hmisc):", round(gbm_cindex, 3)))
+'''
 ```
+
+## IBS of GBM
+
+```{r}
+# Get predicted risk scores from GBM
+gbm_risk <- predict(gbm_model, newdata = test_data_clean, n.trees = 100)
+
+# Compute baseline hazard (returns a vector)
+base_hazard <- gbm::basehaz.gbm(
+  t = test_data_clean$survival_days,
+  delta = test_data_clean$event,
+  f.x = gbm_risk,
+  t.eval = sort(unique(test_data_clean$survival_days))
+)
+
+# Compute survival probabilities
+gbm_surv_probs <- t(exp(-outer(base_hazard, exp(gbm_risk))))
+
+# Compute IBS using riskRegression
+brier_gbm <- riskRegression::Score(
+  list(GBM = gbm_surv_probs),
+  formula = Surv(survival_days, event) ~ 1,
+  data = test_data_clean,
+  times = sort(unique(test_data_clean$survival_days)),
+  summary = "ibs",
+  cens.model = "km"
+)
+
+# Extract IBS
+ibs_gbm <- brier_gbm$Brier$score[brier_gbm$Brier$score$model == "GBM", "IBS"]
+print(paste("GBM IBS:", ibs_gbm))
+```
+
+## RSF Predicted Survival Times
 
 ```{r}
 time_points <- c(90, 360, 720, 1460)
@@ -171,14 +316,6 @@ for (i in 1:5) {
 ```
 
 ```{r}
-gbm_cindex <- Hmisc::rcorr.cens(
-  x = -gbm_pred,  # Note the negative sign to ensure proper risk direction
-  S = y_test
-)["C Index"]
-print(paste("GBM C-index (Hmisc):", round(gbm_cindex, 3)))
-```
-
-```{r}
 rcorr.cens # CORRELATION COEFFICIENT FOR CENSORED DATA
 ```
 
@@ -188,6 +325,193 @@ rcorr.cens # CORRELATION COEFFICIENT FOR CENSORED DATA
 
 ## try getting graph with p values / z scores of each covariate
 
+## Ranger Model Creation and Running It, w/ Feature Importance
+
 ```{r}
 
+# Prepare the data (using your existing train/test split)
+# Remove ID columns and the binary survival target (keep only survival_days and event)
+
+# have to "clean" the names for ranger to work
+clean_names <- function(df) {
+  names(df) <- gsub("[^[:alnum:]]", "_", names(df))
+  names(df) <- gsub("_+", "_", names(df))  # replace multiple _ with single
+  names(df) <- gsub("_$", "", names(df))   # remove trailing _
+  names(df) <- gsub("^_", "", names(df))   # remove leading _
+  df
+}
+
+train_ranger <- train_data_clean %>% clean_names()
+train_ranger <- train_ranger[complete.cases(train_ranger), ]
+
+test_ranger <- test_data_clean %>% clean_names()
+
+# Fit the ranger random survival forest
+ranger_model <- ranger(
+  formula = Surv(survival_days, event) ~ .,
+  data = train_ranger,
+  num.trees = 1000,               # Number of trees
+  mtry = NULL,                    # Number of variables to possibly split at (default is sqrt(p))
+  min.node.size = 15,             # Minimal node size
+  splitrule = "logrank",          # Splitting rule for survival
+  importance = "permutation",     # Variable importance mode
+  seed = 7,                       # For reproducibility
+  verbose = TRUE                  # Print progress
+)
+
+# Print the model
+print(ranger_model)
+
+# Make predictions on test data
+ranger_pred <- predict(
+  object = ranger_model,
+  data = test_ranger,
+  type = "response"  # Returns predicted survival times
+)
+
+# You can also get survival probabilities at specific time points
+# First get unique event times from training data
+times <- sort(unique(train_ranger$survival_days[train_ranger$event == 1]))
+
+# Get survival probabilities at these times
+ranger_surv <- predict(
+  object = ranger_model,
+  data = test_ranger,
+  type = "response",
+  fun = function(x) x$survival  # Returns survival probabilities
+)
+
+# To get predicted survival probabilities at 90 days:
+# Find the time point closest to 90 days
+time_idx <- which.min(abs(times - 90))
+surv_prob_90 <- ranger_surv$survival[, time_idx]
+
+# Variable importance
+if (!is.null(ranger_model$variable.importance)) {
+  vi <- sort(ranger_model$variable.importance, decreasing = TRUE)
+  print(vi)
+  barplot(vi, las = 2, cex.names = 0.7, main = "Variable Importance")
+}
+```
+
+## Ranger probability predictions for each interval
+
+```{r}
+predictSurvProb.ranger <- function(object, newdata, times, ...) {
+  pred <- predict(object, data = newdata)$survival
+  train_times <- object$unique.death.times
+  idx <- sapply(times, function(t) which.min(abs(train_times - t)))
+  surv_probs <- pred[, idx, drop = FALSE]
+  return(surv_probs)
+}
+
+pred_surv <- predictSurvProb(ranger_model, newdata = test_ranger, times = times)
+```
+
+## C-Index for Ranger
+
+```{r}
+
+# Predict survival probabilities at a fixed time, say 90 days
+time_idx <- which.min(abs(times - 90))
+surv_probs_90 <- predictSurvProb.ranger(ranger_model, test_ranger, times = times)[, time_idx]
+
+# Risk score as 1 - survival probability
+risk_score <- surv_probs_90
+
+# Concordance index
+conc <- concordance(Surv(test_ranger$survival_days, test_ranger$event) ~ risk_score)
+print(conc$concordance)
+
+```
+
+## IBS Score for Ranger
+
+```{r}
+# Define formula explicitly (no dot)
+predictors <- setdiff(names(test_ranger), c("survival_days", "event"))
+fmla <- as.formula(paste("Surv(survival_days, event) ~", paste(predictors, collapse = "+")))
+
+# times: vector of evaluation times (e.g., unique event times)
+times <- sort(unique(train_ranger$survival_days[train_ranger$event == 1]))
+
+pec_results <- pec(
+  object = list("RSF Ranger" = ranger_model),
+  formula = fmla,
+  data = test_ranger,
+  times = times,
+  cens.model = "cox",
+  exact = FALSE,
+  splitMethod = "none",
+  predictSurvProb = predictSurvProb.ranger
+)
+
+# Extract Integrated Brier Score (IBS)
+ibs <- crps(pec_results)  # crps() returns IBS integrated over times
+print(ibs)
+```
+
+## Permutation Test
+
+```{r}
+
+names(train_data_clean) <- make.names(names(train_data_clean))
+train_data_clean <- train_data_clean %>%
+  filter(!is.na(survival_days))
+
+#train_data_clean <- train_data_clean %>% select(-language)
+train_data_clean <- train_data_clean[complete.cases(train_data_clean), ]
+
+
+imp_pvals <- importance_pvalues(
+  ranger_model,
+  method = "altmann",   # Recommended for survival models
+  formula = Surv(survival_days, event) ~ .,
+  data = train_data_clean,
+  num.permutations = 50
+)
+
+imp_pvals
+```
+
++----------+--------------------+--------------+-----------+----------+
+| \        | admission_location | age.at.admit | gcs_total |          |
+| dbsource |                    |              |           |          |
+|          | \<fctr\>           | \<dbl\>      | \<int\>   |          |
+| \<fctr\> |                    |              |           |          |
++:=========+:===================+=============:+==========:+==========+
+|          |                    |              |           |          |
++----------+--------------------+--------------+-----------+----------+
+
+```{r}
+imp_pvals_df <- as.data.frame(imp_pvals)
+imp_pvals_df %>%
+  arrange(desc(pvalue))
+```
+
+```{r}
+library(tibble)
+library(ggrepel)
+imp_pvals_df <- imp_pvals_df %>%
+  rownames_to_column("variable")
+
+ggplot(imp_pvals_df, aes(x = importance, y = pvalue, color = pvalue < 0.05)) +
+  geom_point() +
+  geom_text_repel(
+    aes(label = ifelse(pvalue < 0.05 | importance > 0.01, variable, "")),
+    size = 3,
+    max.overlaps = 100,  # Allow more overlaps before hiding labels
+    force = 2,           # Increase repulsion force
+    force_pull = 0.5,    # Reduce pull toward points
+    min.segment.length = 0,  # Always draw segments
+    box.padding = 0.5,   # More padding around labels
+    point.padding = 0.2, # More padding around points
+    nudge_x = 0,       # Slight nudge horizontally
+    nudge_y = 0.1,       # Slight nudge vertically
+    segment.color = "grey50",  # Make segments less prominent
+    segment.alpha = 0.5,
+    seed = 42            # For reproducibility
+  ) +
+  labs(title = "P-value vs. Importance (Significant Variables Labeled)") +
+  theme_minimal()
 ```
