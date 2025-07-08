@@ -1,0 +1,337 @@
+---
+title: "survival4_pseudo"
+output: html_document
+date: "2025-07-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Pre-processing the data
+```{r}
+library(readr)
+dat <- read.csv("merged_v4.csv")
+dat <- dat%>%
+  select(-1)%>%
+  select(-PO_1460)
+# ───────────── 0 categorize the ethnicity ───────────────────────────────
+dat <- dat |>
+  mutate(ethnicity = case_when(
+    str_detect(ethnicity, regex("ASIAN"   , TRUE)) ~ "Asian",
+    str_detect(ethnicity, regex("WHITE|MIDDLE", TRUE)) ~ "White",
+    str_detect(ethnicity, regex("BLACK"   , TRUE)) ~ "Black or African American",
+    str_detect(ethnicity, regex("OTHER|PATIENT|UNABLE|UNKNOWN", TRUE)) ~ "Unknown",
+    str_detect(ethnicity, regex("AMERICAN", TRUE)) ~ "American Indian or Alaska Native",
+    str_detect(ethnicity, regex("HISPANIC", TRUE)) ~ "Hispanic",
+    str_detect(ethnicity, regex("MULTI"   , TRUE)) ~ "More than one race",
+    TRUE ~ ethnicity)) |>
+  mutate(across(where(is.character), factor))
+write.csv(dat,"merged_v5.csv")
+```
+
+### MICE for multiple imputation after train-test splitting
+```{r}
+library(mice)
+library(dplyr)
+library(glmnet)
+library(Matrix)
+library(survival)
+# ───────────── 1 fix train / test ID  ────────────────
+set.seed(2025)
+all_id   <- unique(dat$subject_id)
+train_id <- sample(all_id, 0.60 * length(all_id))
+test_id  <- setdiff(all_id, train_id)
+
+train_raw <- dat |> filter(subject_id %in% train_id)
+test_raw  <- dat |> filter(subject_id %in% test_id )
+
+# ───────────── 2 mice settings ────────────────────────────
+meth <- make.method(dat)
+meth[c("age.at.admit","gcs_total")] <- "pmm"
+multicat <- c("admission_type","admission_location","discharge_location",
+              "insurance","language","religion","marital_status","ethnicity")
+meth[multicat] <- "cart"
+meth[c("subject_id","survival_days","event")] <- ""
+
+pred <- make.predictorMatrix(dat)
+pred[ , c("subject_id","survival_days","event",
+          grep("^PO_", names(dat), value = TRUE))] <- 0
+
+# ───────────── 3 multiple imputation separately for train/test dataset ───────────────
+imp_train <- mice(train_raw, m = 5, method = meth, predictorMatrix = pred,
+                  maxit = 20, seed = 2025, printFlag = TRUE)
+imp_test  <- mice(test_raw , m = 5, method = meth, predictorMatrix = pred,
+                  maxit = 20, seed = 2025, printFlag = TRUE)
+
+train_list <- complete(imp_train, "all")   # list of 5 df
+test_list  <- complete(imp_test , "all")
+```
+
+### Method 1: Linear Regression with LASSO
+```{r}
+library(survival)
+set.seed(2025)
+t_grid   <- c(7, 30, 60, 180, 365, 730)
+po_cols  <- paste0("PO_", t_grid)
+m_imp    <- 5        # 5 条插补链
+
+# 结果容器
+iAUC_vec <- var_vec <- numeric(m_imp)
+IBS_vec <- numeric(m_imp)
+
+coef_list <- lapply(t_grid, function(.x) vector("list", m_imp))
+names(coef_list) <- paste0("t_", t_grid)
+
+for (m in 1:m_imp) {
+  tr <- train_list[[m]] ; te <- test_list[[m]]
+  base_vars <- setdiff(names(tr),
+                       c("survival_days","event",
+                         grep("^PO_", names(tr), value = TRUE),
+                         "subject_id"))
+  
+  ## ------------- ① 6 结点循环 ------------------
+  S_hat <- matrix(NA, nrow = nrow(te), ncol = length(t_grid))
+  for (k in seq_along(t_grid)) {
+    X_tr <- sparse.model.matrix(reformulate(base_vars), tr)[,-1]
+    X_te <- sparse.model.matrix(reformulate(base_vars), te)[,-1]
+    
+    fit  <- cv.glmnet(X_tr, tr[[po_cols[k]]],
+                      family="gaussian", alpha=1, nfolds=5)
+    
+    ## —— 保存系数 (含截距) ——
+    beta <- as.vector(coef(fit, s = "lambda.min"))
+    names(beta) <- rownames(coef(fit, s = "lambda.min"))
+    coef_list[[k]][[m]] <- beta
+    
+    ## —— 预测 → S_hat ——
+    S_hat[,k] <- pmin(pmax(predict(fit, X_te, s="lambda.min"),0),1)
+  }
+  S_hat <- t(apply(S_hat, 1, function(x) cummin(x)))
+  
+  ## ------------- ② 手算 C / iAUC（与你原来相同） ----------
+  time <- te$survival_days; status <- te$event
+  Cvec <- weight <- rep(NA, length(t_grid))
+  for (k in seq_along(t_grid)) {
+    early <- which(status==1 & time <= t_grid[k])
+    late  <- which(time   >  t_grid[k])
+    npair <- length(early)*length(late)
+    if(npair==0){Cvec[k]<-NA; next}
+    risk <- 1 - S_hat[,k]
+    conc <- sum(outer(risk[early], risk[late], ">"))
+    ties <- sum(outer(risk[early], risk[late], "=="))
+    Cvec[k] <- (conc + 0.5*ties)/npair
+    weight[k] <- sum(time >= t_grid[k])
+  }
+  iAUC_vec[m] <- weighted.mean(Cvec, w = weight, na.rm = TRUE)
+  var_vec[m]  <- sum((weight/sum(weight))^2 *
+                     (Cvec*(1-Cvec)/(4*weight^2)), na.rm = TRUE)
+  
+  # ------------- ③ 计算 IPCW 加权 Brier Score（用于 IBS） -------------
+
+  # 1. 拟合 Ĝ(t) = P(C > t) 使用 Kaplan-Meier for censoring
+  km_cens <- survfit(Surv(survival_days, 1 - event) ~ 1, data = te)
+  G_hat   <- stepfun(km_cens$time, c(1, km_cens$surv))   # 拟合 Ĝ(t)
+  
+  brier_ipcw <- numeric(length(t_grid))
+  
+  for (k in seq_along(t_grid)) {
+    t_k <- t_grid[k]
+    
+    y_true <- as.numeric(te$survival_days > t_k)
+    y_pred <- S_hat[,k]
+    
+    # IPCW 权重
+    Gi <- G_hat(pmin(te$survival_days, t_k))
+    wi <- ifelse(te$survival_days >= t_k, 1 / Gi, 0)
+  
+    # 稳定处理极小 Gi
+    wi[is.infinite(wi) | is.na(wi) | Gi < 1e-6] <- 0
+  
+    brier_ipcw[k] <- mean(wi * (y_true - y_pred)^2, na.rm = TRUE)
+}
+
+# 使用 trapezoidal rule 做时间积分（IBS）
+delta_t <- c(t_grid[1], diff(t_grid))   # 区间长度
+IBS_vec[m] <- sum(brier_ipcw * delta_t) / max(t_grid)
+}
+
+## ------------- Rubin 合并 iAUC（保持你原公式） ----------
+qbar <- mean(iAUC_vec); Ubar <- mean(var_vec)
+B    <- var(iAUC_vec)
+Tvar <- Ubar + (1 + 1/m_imp)*B
+se   <- sqrt(Tvar)
+cat(sprintf("Pooled iAUC = %.3f (95%% CI %.3f–%.3f)\n",
+            qbar, qbar-1.96*se, qbar+1.96*se))
+
+ibs_mean <- mean(IBS_vec)
+ibs_se   <- sd(IBS_vec) * sqrt(1 + 1/m_imp)
+cat(sprintf("Pooled IBS (IPCW) = %.3f (95%% CI %.3f–%.3f)\n",
+            ibs_mean, ibs_mean - 1.96 * ibs_se, ibs_mean + 1.96 * ibs_se))
+
+```
+
+### Variable intepration
+```{r}
+library(dplyr)
+library(tibble)   # 提供 rownames_to_column()
+
+pool_coef <- function(beta_m){        # beta_m: m × p
+  qbar <- colMeans(beta_m)
+  B    <- apply(beta_m, 2, var)
+  Tvar <- (1 + 1/m_imp) * B           # Ū≈0 对 glmnet
+  se   <- sqrt(Tvar)
+  cbind(est = qbar, se = se)
+}
+
+pooled_coef <- lapply(coef_list, function(lst){
+  all_nm <- unique(unlist(lapply(lst, names)))
+  beta_m <- t(sapply(lst, function(v){
+               tmp <- setNames(rep(0,length(all_nm)), all_nm)
+               tmp[names(v)] <- v; tmp }))
+  pool_coef(beta_m)                   # p × 2 matrix
+})
+
+top_list <- lapply(names(pooled_coef), function(nm){
+  tibble::rownames_to_column(
+    as.data.frame(pooled_coef[[nm]]), var = "term") |>
+    #filter(term != "(Intercept)") |>
+    arrange(desc(abs(est))) |>
+    slice_head(n = 10) |>
+    select(term, est)                     
+})
+names(top10_list) <- names(pooled_coef)
+
+# —— print —— #
+for (nm in names(top10_list)){
+  cat("\n===== Top-10 at", sub("t_", "", nm), "days =====\n")
+  print(top10_list[[nm]], row.names = FALSE, digits = 4)
+}
+```
+
+### Method 2:  Random Forest
+```{r}
+library(survival)
+library(ranger)          # fast random forest
+set.seed(2025)
+
+
+t_grid   <- c(7, 30, 60, 180, 365, 730)
+po_cols  <- paste0("PO_", t_grid)
+m_imp    <- 5            # multiple-imputation chains
+
+# 结果容器
+iAUC_vec <- var_vec <- numeric(m_imp)
+IBS_vec  <- numeric(m_imp)
+
+
+importance_list <- lapply(t_grid, function(.x) vector("list", m_imp))
+names(importance_list) <- paste0("t_", t_grid)
+fit_store <- lapply(t_grid, function(.x) vector("list", m_imp))  # 若之后想算 SHAP
+
+for (m in 1:m_imp) {
+  tr <- train_list[[m]] ; te <- test_list[[m]]
+
+  base_vars <- setdiff(
+      names(tr),
+      c("survival_days","event", grep("^PO_", names(tr), value = TRUE),"subject_id")
+  )
+
+  S_hat <- matrix(NA, nrow = nrow(te), ncol = length(t_grid))
+
+  ## -------- 每个时间结点建一个随机森林回归 --------
+  for (k in seq_along(t_grid)) {
+
+    # 构造训练数据框
+    tr_sub <- tr[, c(base_vars, po_cols[k])]
+    te_sub <- te[, base_vars]
+
+    # ranger 随机森林回归
+    fit <- ranger(
+      formula = as.formula(paste0(po_cols[k], " ~ .")),
+      data    = tr_sub,
+      num.trees = 500,
+      mtry      = floor(sqrt(length(base_vars))),
+      importance = "impurity",
+      seed = 2025
+    )
+    
+    importance_list[[k]][[m]] <- fit$variable.importance   # ⬅️ 新增
+    fit_store[[k]][[m]] <- fit                             # ⬅️ 若想算 SHAP
+
+    # 预测
+    pred <- predict(fit, data = te_sub)$predictions
+    S_hat[, k] <- pmin(pmax(pred, 0), 1)    # 裁剪到 [0,1]
+  }
+
+  # 保证生存概率随时间单调递减
+  S_hat <- t(apply(S_hat, 1, cummin))
+
+  ## -------- 计算 iAUC --------
+  time   <- te$survival_days
+  status <- te$event
+  Cvec   <- weight <- rep(NA, length(t_grid))
+
+  for (k in seq_along(t_grid)) {
+    early <- which(status == 1 & time <= t_grid[k])
+    late  <- which(time   >  t_grid[k])
+    npair <- length(early)*length(late)
+    if (npair == 0) { Cvec[k] <- NA; next }
+    risk  <- 1 - S_hat[, k]
+    conc  <- sum(outer(risk[early], risk[late], ">"))
+    ties  <- sum(outer(risk[early], risk[late], "=="))
+    Cvec[k] <- (conc + 0.5*ties) / npair
+    weight[k] <- sum(time >= t_grid[k])
+  }
+  iAUC_vec[m] <- weighted.mean(Cvec, w = weight, na.rm = TRUE)
+  var_vec[m]  <- sum((weight/sum(weight))^2 *
+                     (Cvec*(1-Cvec)/(4*weight^2)), na.rm = TRUE)
+
+  ## -------- 计算 IPCW-IBS --------
+  km_cens <- survfit(Surv(survival_days, 1 - event) ~ 1, data = te)
+  G_hat   <- stepfun(km_cens$time, c(1, km_cens$surv))
+
+  brier_ipcw <- numeric(length(t_grid))
+  for (k in seq_along(t_grid)) {
+    t_k    <- t_grid[k]
+    y_true <- as.numeric(time > t_k)
+    y_pred <- S_hat[, k]
+
+    Gi <- G_hat(pmin(time, t_k))
+    wi <- ifelse(time >= t_k, 1/Gi, 0)
+    wi[is.infinite(wi) | is.na(wi) | Gi < 1e-6] <- 0
+
+    brier_ipcw[k] <- mean(wi * (y_true - y_pred)^2, na.rm = TRUE)
+  }
+  delta_t   <- c(t_grid[1], diff(t_grid))
+  IBS_vec[m] <- sum(brier_ipcw * delta_t) / max(t_grid)
+}
+
+## Rubin 合并
+qbar <- mean(iAUC_vec); Ubar <- mean(var_vec); B <- var(iAUC_vec)
+Tvar <- Ubar + (1 + 1/m_imp)*B; se <- sqrt(Tvar)
+cat(sprintf("Pooled iAUC = %.3f  (95%% CI %.3f–%.3f)\n",
+            qbar, qbar-1.96*se, qbar+1.96*se))
+
+ibs_mean <- mean(IBS_vec)
+ibs_se   <- sd(IBS_vec)*sqrt(1 + 1/m_imp)
+cat(sprintf("Pooled IBS  = %.3f  (95%% CI %.3f–%.3f)\n",
+            ibs_mean, ibs_mean-1.96*ibs_se, ibs_mean+1.96*ibs_se))
+```
+
+```{r}
+topN <- 10   # 想看前多少个变量自己改
+for (k in seq_along(t_grid)) {
+  # 把 m_imp 条链的 importance 向量拼成矩阵：行 = 变量，列 = 链
+  imp_mat  <- do.call(cbind, importance_list[[k]])
+  imp_mean <- rowMeans(imp_mat, na.rm = TRUE)
+
+  top_df <- data.frame(var = names(imp_mean), imp = imp_mean) %>%
+              arrange(desc(imp)) %>% slice_head(n = topN)
+
+  cat("\n===== Top", topN, "variables at", t_grid[k], "days =====\n")
+  print(top_df, row.names = FALSE, digits = 4)
+}
+```
+
+
