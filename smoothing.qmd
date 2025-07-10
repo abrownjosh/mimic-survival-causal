@@ -1,0 +1,216 @@
+---
+title: "smoothing"
+format: html
+editor: visual
+---
+
+## Quarto
+
+Quarto enables you to weave together content and executable code into a finished document. To learn more about Quarto see <https://quarto.org>.
+
+## Running Code
+
+When you click the **Render** button a document will be generated that includes both content and the output of embedded code. You can embed code like this:
+
+```{r}
+1 + 1
+```
+
+You can add options to executable code like this
+
+```{r}
+#| echo: false
+2 * 2
+```
+
+The `echo: false` option disables the printing of code (only output is displayed).
+
+```{r}
+library(tidyverse)
+ne <- new.env()
+load(file="allergy.RData")
+data = allergy
+```
+
+```{r}
+
+lm(allergy$logpollen ~ allergy$day)
+
+allergy %>% ggplot(aes(x = day, y = logpollen, color=age)) +
+  geom_point() +
+  labs(x = "day", y = "log pollen") +
+  theme_minimal()
+```
+
+## 2. I would use splines at 175 days and 225 days because this seems like it would be where the data breaks in terms of linear behavior.
+
+```{r}
+phi1 <- allergy$day < 175
+phi2 <- allergy$day*phi1
+phi3 <- allergy$day < 225 & allergy$day >= 175
+phi4 <- allergy$day*phi3
+phi5 <- allergy$day >= 225
+phi6 <- allergy$day*phi5
+pl.fit <- lm(logpollen ~ phi1+phi2+phi3+phi4+phi5+phi6-1, data=allergy)
+
+
+allergy$fitted <- fitted(pl.fit)
+
+ggplot(allergy, aes(x = day)) +
+  geom_point(aes(y = logpollen), color = "gray") +
+  geom_line(aes(y = fitted), color = "blue", size = 1) +
+  labs(title = "Piecewise Linear Fit", y = "log(Pollen)") +
+  theme_minimal()
+```
+
+```{r}
+phi1 <- data$day < 175
+phi2 <- data$day * phi1
+phi3 <- data$day ^ 2 * phi1
+phi4 <- data$day ^ 3 * phi1
+phi5 <- data$day < 225 & data$day >= 175
+phi6 <- data$day*phi5
+phi7 <- data$day ^ 2 * phi5
+phi8 <- data$day ^ 3 * phi5
+phi9 <- data$day >= 225
+phi10 <- data$day * phi9
+phi11 <- data$day ^ 2 * phi9
+phi12 <- data$day ^ 3 * phi9
+
+#pl.fit <- lm(logpollen ~ phi1+phi2+phi3+phi4+phi5+phi6-1, data=allergy)
+
+pc.fit <- lm(logpollen ~ phi1+phi2+phi3+phi4+phi5+phi6
++phi7+phi8+phi9+phi10+phi11+phi12-1, data=allergy)
+
+allergy$fitted.cubic <- fitted(pc.fit)
+
+ggplot(allergy, aes(x = day)) +
+  geom_point(aes(y = logpollen), color = "gray") +
+  geom_line(aes(y = fitted.cubic), color = "blue", size = 1) +
+  labs(title = "Piecewise Linear Fit", y = "log(Pollen)") +
+  theme_minimal()
+```
+
+## 4
+
+```{r}
+anova(pl.fit, pc.fit)
+```
+
+## 5
+
+```{r}
+phi1 <- allergy$day < 190
+phi2 <- allergy$day*phi1
+phi3 <- allergy$day < 210 & allergy$day >= 190
+phi4 <- allergy$day*phi3
+phi5 <- allergy$day >= 210
+phi6 <- allergy$day*phi5
+pl5.fit <- lm(logpollen ~ phi1+phi2+phi3+phi4+phi5+phi6-1, data=allergy)
+
+
+allergy$fitted5 <- fitted(pl5.fit)
+
+ggplot(allergy, aes(x = day)) +
+  geom_point(aes(y = logpollen), color = "gray") +
+  geom_line(aes(y = fitted5), color = "blue", size = 1) +
+  labs(title = "Piecewise Linear Fit", y = "log(Pollen)") +
+  theme_minimal()
+```
+
+##  6
+
+```{r}
+phi1 <- data$day < 190
+phi2 <- data$day * phi1
+phi3 <- data$day ^ 2 * phi1
+phi4 <- data$day ^ 3 * phi1
+phi5 <- data$day < 210 & data$day >= 190
+phi6 <- data$day*phi5
+phi7 <- data$day ^ 2 * phi5
+phi8 <- data$day ^ 3 * phi5
+phi9 <- data$day >= 210
+phi10 <- data$day * phi9
+phi11 <- data$day ^ 2 * phi9
+phi12 <- data$day ^ 3 * phi9
+
+#pl.fit <- lm(logpollen ~ phi1+phi2+phi3+phi4+phi5+phi6-1, data=allergy)
+
+pc.fit6 <- lm(logpollen ~ phi1+phi2+phi3+phi4+phi5+phi6
++phi7+phi8+phi9+phi10+phi11+phi12-1, data=allergy)
+
+allergy$fitted6 <- fitted(pc.fit6)
+
+ggplot(allergy, aes(x = day)) +
+  geom_point(aes(y = logpollen), color = "gray") +
+  geom_line(aes(y = fitted6), color = "blue", size = 1) +
+  labs(title = "Piecewise Linear Fit", y = "log(Pollen)") +
+  theme_minimal()
+```
+
+## 7
+
+```{r}
+
+allergy$b1 <- pmax(allergy$day - 190, 0)^3
+allergy$b2 <- pmax(allergy$day - 210, 0)^3
+
+lm.cubspline <- lm(logpollen ~ day + b1 + b2, data = allergy)
+
+allergy$fitted <- fitted(lm.cubspline)
+
+ggplot(allergy, aes(x = day)) +
+  geom_point(aes(y = logpollen), color = "gray") +
+  geom_line(aes(y = fitted, color=age), size = 1) +
+  labs(title = "Cubic Spline Fit", y = "log(Pollen)") +
+  theme_minimal()
+```
+
+```{r}
+library(splines)
+Bmat <- bs(data$day, df=6)
+my_cubspline <- lm(logpollen~Bmat, data=data)
+
+data$fitted <- fitted(my_cubspline)
+
+ggplot(data, aes(x = day)) +
+  geom_point(aes(y = logpollen), color = "gray") +
+  geom_line(aes(y = fitted), color = "blue", size = 1) +
+  labs(title = "Spline Fit", y = "log(Pollen)") +
+  theme_minimal()
+```
+
+```{r}
+
+spline_model <- lm(logpollen ~ treatment * bs(day, df = 5), data = data)
+
+day_grid <- seq(min(data$day), max(data$day), length.out = 300)
+treatments <- unique(data$treatment)
+
+data$treatment = data$treat
+data$treatment <- as.factor(data$treatment)
+newdata$treatment <- as.factor(newdata$treatment)
+
+# Create new data for prediction
+newdata <- expand.grid(day = day_grid, treatment = treatments)
+
+# Predict fitted log(pollen) values
+newdata$logpollen_pred <- predict(spline_model, newdata)
+
+ggplot() +
+  geom_point(data = data, aes(x = day, y = logpollen, color = treatment), alpha = 0.3) +
+  geom_line(data = newdata, aes(x = day, y = logpollen_pred, color = treatment), size = 1.2) +
+  labs(title = "Fitted Spline Models for Each Treatment Group",
+       x = "Day", y = "log(Pollen)") +
+  theme_minimal() +
+  scale_color_brewer(palette = "Dark2")
+```
+
+```{r}
+summary(log(my_data$y))
+```
+
+```{r}
+str(data$treatment)
+str(newdata$treatment)
+```

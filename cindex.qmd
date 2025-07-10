@@ -20,6 +20,7 @@ library(survAUC) # concordance index
 library(stringr)
 library(mice)
 library(ranger)
+library(gbm)
 ```
 
 ## Reading Merged_V4 (from end of 7/7) and running the data imputation. This does NOT impute survival times, but it DOES impute age.at.admit and gcs_total.
@@ -123,6 +124,8 @@ mm <- model.matrix(~ . - 1, data = sps[, ..cat_vars])
 
 # combining back with the rest of dataset
 sps <- cbind(sps[, !cat_vars, with = FALSE], as.data.table(mm))
+
+time_buckets <- c(7, 30, 60, 180, 365, 730)
 ```
 
 ## ignorable: some extra filtering that is no longer necessary
@@ -146,7 +149,7 @@ sps <- cbind(sps[, !cat_vars, with = FALSE], as.data.table(mm))
 #data <- cbind(X, y)
 ```
 
-## splitting into train/test, building RSF and GBM models and getting their predictions
+## splitting into train/test
 
 ```{r}
 
@@ -173,23 +176,60 @@ train_data_clean <- train_data_clean %>% filter(complete.cases(.))
 test_data_clean <- test_data_clean %>% filter(complete.cases(.))
 
 # fit random survival forest
-rsf_model <- rfsrc(Surv(survival_days, event) ~ ., data = train_data_clean)
-
-# fit gradient boosting model (Cox PH boosting)
-library(gbm)
-gbm_model <- gbm(Surv(survival_days, event) ~ ., 
-                 data = train_data_clean,
-                 distribution = "coxph",
-                 n.trees = 100)
+rsf_model <- rfsrc(Surv(survival_days, event) ~ ., data = train_data_clean, importance="permute")
 
 rsf_pred <- predict(rsf_model, newdata = test_data_clean)
 
-gbm_pred <- predict(gbm_model, newdata = test_data_clean, n.trees = 100)
-
-
+# fit gradient boosting model (Cox PH boosting)
 ```
 
-## C-Index of RSF
+```{r}
+
+vi <- rsf_model$importance
+
+# Convert to data frame and sort
+vi_df <- data.frame(
+  variable = names(vi),
+  importance = as.numeric(vi)
+) %>%
+  dplyr::arrange(desc(importance)) %>%
+  dplyr::slice(1:10)  # Top 10
+
+
+max_len <- 15
+
+vi_df <- vi_df %>%
+  mutate(
+    variable_abbr = ifelse(
+      str_length(variable) > max_len,
+      str_trunc(variable, max_len, ellipsis = "..."),
+      variable
+    )
+  )
+
+ggplot(vi_df, aes(x = reorder(variable_abbr, -importance), y = importance)) +
+  geom_col(fill = "steelblue") +
+  labs(
+    title = "Top 10 Feature Importances (RSF)",
+    x = "Variable",
+    y = "Permutation Importance"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+## Setting up RSF
+
+```{r}
+# fit random survival forest
+rsf_model <- rfsrc(Surv(survival_days, event) ~ ., data = train_data_clean)
+
+rsf_pred <- predict(rsf_model, newdata = test_data_clean)
+```
+
+## faulty C-Index of RSF
 
 ```{r}
 y_test <- Surv(test_data_clean$survival_days, test_data_clean$event)
@@ -205,11 +245,86 @@ rsf_cindex <- randomForestSRC::get.cindex(time = test_data_clean$survival_days,
                                censoring = test_data_clean$event,
                                predicted = -rsf_pred$predicted)
 print(paste("RSF C-index:", round(rsf_cindex, 3)))
+```
 
+## real C-index of RSF
+
+```{r}
+
+time_idx <- sapply(time_buckets, function(t) which.min(abs(rsf_pred$time.interest - t)))
+
+# Get predicted survival probabilities at each bucket
+# Risk scores = 1 - survival probability
+surv_probs <- rsf_pred$survival[, time_idx]
+risk_scores <- 1 - surv_probs
+
+cindex_results <- data.frame(Time = time_buckets, C_index = NA)
+
+for (i in seq_along(time_buckets)) {
+  t <- time_buckets[i]
+  risk <- risk_scores[, i]
+
+  # Compute time-dependent ROC and AUC
+  roc <- timeROC(
+    T = test_data_clean$survival_days,
+    delta = test_data_clean$event,
+    marker = risk,
+    cause = 1,
+    times = t,
+    iid = TRUE
+  )
+  
+  cindex_results$C_index[i] <- roc$AUC[2]
+}
+
+print(paste(cindex_results, mean(cindex_results$C_index)))
+mean(cindex_results$C_index)
+```
+
+```{r}
+ggplot(cindex_results, aes(x = factor(Time), y = C_index)) +
+  geom_col(fill = "#2E86C1", width = 0.6) +
+  geom_text(aes(label = round(C_index, 3)), vjust = -0.5, size = 5) +
+  labs(
+    title = "C-index by Survival Time Probability Prediction",
+    x = "Survival Time (Days)",
+    y = "C-index"
+  ) +
+  ylim(0, 1) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 12)
+  )
 
 ```
 
 ## IBS Score for RSF
+
+```{r}
+library(randomForestSRC)
+library(pec)
+
+# Fit RSF model
+
+# Define evaluation times (use training event times)
+times <- rsf_pred$time.interest
+
+#fmla <- as.formula(paste("Surv(survival_days, event) ~", paste(predictors, collapse = "+")))
+
+ibs_rsf_result <- pec(
+  object = list("RSF" = rsf_model),
+  formula = Surv(survival_days, event) ~ 1,
+  data = test_data_clean,
+  times = times,
+  cens.model = "cox",      # Use Kaplan-Meier to estimate censoring survival function
+  exact = FALSE,
+  splitMethod = "none"    # No cross-validation
+)
+
+crps(ibs_rsf_result)
+```
 
 ```{r}
 # Get predicted survival probabilities from RSF
@@ -229,18 +344,45 @@ brier_rsf <- riskRegression::Score(
   cens.model = "km"  # Method for handling censoring
 )
 
-# Extract IBS
+# The IBS is already calculated by riskRegression::Score - no need for manual integration
+# Just extract it directly from the results
 ibs_rsf <- brier_rsf$Brier$score[brier_rsf$Brier$score$model == "RSF", "IBS"]
-print(paste("RSF IBS:", ibs_rsf))
 
-time_points <- rsf_pred$time.interest     # Corresponding time points
+times <- brier_scores$times
+brier_values <- brier_scores$Brier
 
-# Approximate IBS (trapezoidal rule for integration)
-ibs_rsf <- sum(diff(time_points) * (ibs_rsf[-1] + ibs_rsf[-length(ibs_rsf)])) / 2 / max(time_points)
-print(paste("Approximate RSF IBS:", ibs_rsf))
+# Compute IBS using trapezoidal integration
+ibs_manual <- sum(
+  diff(times) * (brier_values[-1] + brier_values[-length(brier_values)]) / 2
+) / max(times)
+
+# Compare with built-in IBS (should be very close)
+print(paste("RSF IBS:", ibs_manual))
 ```
 
-## C-Index of GBM
+```{r}
+plot.variable(rsf_model,
+              xvar.names = c("age.at.admit"),      # Feature of interest
+              partial = TRUE,          # Turn on partial dependence
+              surv.type = "surv",      # Can also try "hazard" or "mort"
+              time = 365,               # Time at which to evaluate survival probability
+              main = c("Age Partial Dependence Plot (365 Days)"),
+              xlab = "Age at Hospital Admission",
+  ylab = "Survival Probability at 365 Days",)
+```
+
+## Setting up GBM
+
+```{r}
+gbm_model <- gbm(Surv(survival_days, event) ~ ., 
+                 data = train_data_clean,
+                 distribution = "coxph",
+                 n.trees = 100)
+
+gbm_pred <- predict(gbm_model, newdata = test_data_clean, n.trees = 100)
+```
+
+## BAD C-Index of GBM
 
 ```{r}
 gbm_concordance <- concordance(y_test ~ gbm_pred)
@@ -251,55 +393,164 @@ if (gbm_concordance$concordance < 0.5) {
 print(paste("GBM C-index:", round(gbm_concordance$concordance, 3)))
 
 ## ADDITIONAL CODE THAT GETS THE SAME THING ###
-'''
-{r}
-gbm_cindex <- Hmisc::rcorr.cens(
-  x = -gbm_pred,  # Note the negative sign to ensure proper risk direction
-  S = y_test
-)["C Index"]
-print(paste("GBM C-index (Hmisc):", round(gbm_cindex, 3)))
-'''
+## '''
+## {r}
+## gbm_cindex <- Hmisc::rcorr.cens(
+##   x = -gbm_pred,  # Note the negative sign to ensure proper risk direction
+##   S = y_test
+## )["C Index"]
+## print(paste("GBM C-index (Hmisc):", round(gbm_cindex, 3)))
+## '''
+```
+
+## GBM Predicted Survival Times
+
+```{r}
+# 1. Fit GBM Cox model
+gbm_model <- gbm(Surv(survival_days, event) ~ ., 
+                 data = train_data_clean,
+                 distribution = "coxph",
+                 n.trees = 100)
+
+
+# 2. Predict log-relative hazard (linear predictor)
+gbm_pred <- predict(gbm_model, newdata = test_data_clean, n.trees = 100)
+
+# 3. Fit baseline survival from training data (Kaplan-Meier)
+base_surv <- survfit(Surv(survival_days, event) ~ 1, data = train_data_clean)
+
+# 4. Define desired time buckets
+time_buckets <- c(7, 30, 60, 180, 365, 730)
+
+# 5. Compute predicted survival for each person at each bucket
+# Create a matrix to store survival probabilities
+surv_probs <- matrix(NA, nrow = length(gbm_pred), ncol = length(time_buckets))
+colnames(surv_probs) <- paste0("t_", time_buckets)
+
+# Normalize the linear predictors
+gbm_pred_centered <- gbm_pred - mean(gbm_pred)
+
+for (j in seq_along(time_buckets)) {
+  t <- time_buckets[j]
+  # Find closest time in baseline survival
+  closest_time_idx <- which.min(abs(base_surv$time - t))
+  S0_t <- base_surv$surv[closest_time_idx]
+
+  # Individual survival prediction: S(t)^exp(lp)
+  surv_probs[, j] <- S0_t ^ exp(gbm_pred_centered)
+}
+
+test_data <- test_data %>% filter(complete.cases(.))
+
+# Optional: bind with subject ID if available
+gbm_surv_preds <- data.frame(subject_id = test_data$subject_id, surv_probs)
+print(head(gbm_surv_preds, 10))  # Show predictions for first 10 patients
 ```
 
 ## IBS of GBM
 
 ```{r}
-# Get predicted risk scores from GBM
-gbm_risk <- predict(gbm_model, newdata = test_data_clean, n.trees = 100)
 
-# Compute baseline hazard (returns a vector)
-base_hazard <- gbm::basehaz.gbm(
-  t = test_data_clean$survival_days,
-  delta = test_data_clean$event,
-  f.x = gbm_risk,
-  t.eval = sort(unique(test_data_clean$survival_days))
-)
+# 2. Define custom prediction function for pec
+predictSurvProb.gbm <- function(object, newdata, times, ...) {
+  # Linear predictor from gbm
+  lp <- predict(object, newdata = newdata, n.trees = object$n.trees)
+  
+  # Baseline survival (from training data)
+  base_surv <- survfit(Surv(survival_days, event) ~ 1, data = train_data_clean)
+  
+  # Interpolate baseline survival at requested times
+  baseline_surv <- approx(
+    x = base_surv$time,
+    y = base_surv$surv,
+    xout = times,
+    method = "constant",
+    rule = 2
+  )$y
 
-# Compute survival probabilities
-gbm_surv_probs <- t(exp(-outer(base_hazard, exp(gbm_risk))))
+  # Return matrix of survival probabilities: S(t|x) = S0(t)^exp(lp - mean(lp))
+  outer(lp - mean(lp), baseline_surv, function(lp, s0) s0 ^ exp(lp))
+}
 
-# Compute IBS using riskRegression
-brier_gbm <- riskRegression::Score(
-  list(GBM = gbm_surv_probs),
+# 3. Define evaluation times
+times <- rsf_pred$time.interest 
+
+# 4. Run pec (with your custom GBM prediction)
+ibs_result <- pec(
+  object = list("GBM" = gbm_model),
   formula = Surv(survival_days, event) ~ 1,
   data = test_data_clean,
-  times = sort(unique(test_data_clean$survival_days)),
-  summary = "ibs",
-  cens.model = "km"
+  times = times,
+  cens.model = "none",
+  exact = FALSE,
+  splitMethod = "none"
 )
 
-# Extract IBS
-ibs_gbm <- brier_gbm$Brier$score[brier_gbm$Brier$score$model == "GBM", "IBS"]
-print(paste("GBM IBS:", ibs_gbm))
+
+#ibs_result <- c
+
+
+ibs_result
+
+# 5. Extract and print IBS
+ibs_gbm <- crps(ibs_result)["GBM"]
+crps(ibs_result)
+```
+
+## C-Index of GBM
+
+```{r}
+library(timeROC)
+
+# Initialize list to store C-index results
+cindex_results <- data.frame(Time = time_buckets, C_index = NA)
+
+for (i in seq_along(time_buckets)) {
+  t <- time_buckets[i]
+  prob <- surv_probs[, i]  # Survival probability at time t
+  risk_score <- -prob      # Higher risk = lower survival
+
+  roc <- timeROC(
+    T = test_data_clean$survival_days,
+    delta = test_data_clean$event,
+    marker = risk_score,
+    cause = 1,
+    times = t,
+    iid = TRUE
+  )
+  
+  cindex_results$C_index[i] <- roc$AUC[2]  # AUC at time t
+}
+
+print(cindex_results)
+mean(cindex_results$C_index)
+```
+
+```{r}
+ggplot(cindex_results, aes(x = factor(Time), y = C_index)) +
+  geom_col(fill = "#2E86C1", width = 0.6) +
+  geom_text(aes(label = round(C_index, 3)), vjust = -0.5, size = 5) +
+  labs(
+    title = "C-index by Survival Time Probability Prediction",
+    x = "Survival Time (Days)",
+    y = "C-index"
+  ) +
+  ylim(0, 1) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 12)
+  )
+
 ```
 
 ## RSF Predicted Survival Times
 
 ```{r}
-time_points <- c(90, 360, 720, 1460)
 
-get_surv_probs <- function(surv_row, time_interest, time_points) {
-  sapply(time_points, function(t) {
+get_surv_probs <- function(surv_row, time_interest, time_buckets) {
+  sapply(time_buckets, function(t) {
     idx <- max(which(time_interest <= t))
     surv_row[idx]
   })
@@ -307,10 +558,10 @@ get_surv_probs <- function(surv_row, time_interest, time_points) {
 
 # printing survival probabilities for first 5 test patients
 for (i in 1:5) {
-  surv_probs <- get_surv_probs(rsf_pred$survival[i, ], rsf_pred$time.interest, time_points)
+  surv_probs <- get_surv_probs(rsf_pred$survival[i, ], rsf_pred$time.interest, time_buckets)
   cat(sprintf("Patient %d survival probabilities:\n", i))
-  for (j in seq_along(time_points)) {
-    cat(sprintf("  P(survival > %d days) = %.3f\n", time_points[j], surv_probs[j]))
+  for (j in seq_along(time_buckets)) {
+    cat(sprintf("  P(survival > %d days) = %.3f\n", time_buckets[j], surv_probs[j]))
   }
 }
 ```
@@ -351,8 +602,8 @@ ranger_model <- ranger(
   formula = Surv(survival_days, event) ~ .,
   data = train_ranger,
   num.trees = 1000,               # Number of trees
-  mtry = NULL,                    # Number of variables to possibly split at (default is sqrt(p))
-  min.node.size = 15,             # Minimal node size
+  mtry = 8,                    # Number of variables to possibly split at (default is sqrt(p))
+  min.node.size = 9,             # Minimal node size
   splitrule = "logrank",          # Splitting rule for survival
   importance = "permutation",     # Variable importance mode
   seed = 7,                       # For reproducibility
@@ -392,6 +643,73 @@ if (!is.null(ranger_model$variable.importance)) {
   print(vi)
   barplot(vi, las = 2, cex.names = 0.7, main = "Variable Importance")
 }
+```
+
+```{r}
+# Define time buckets
+time_buckets <- c(7, 30, 60, 180, 365, 730)
+
+# Step 1: Get survival probabilities at all bucket times
+predictSurvProb.ranger <- function(object, newdata, times, ...) {
+  pred <- predict(object, data = newdata)$survival
+  train_times <- object$unique.death.times
+  idx <- sapply(times, function(t) which.min(abs(train_times - t)))
+  surv_probs <- pred[, idx, drop = FALSE]
+  return(surv_probs)
+}
+
+# Predict survival probabilities at specified time buckets
+bucket_surv_probs <- predictSurvProb.ranger(ranger_model, test_ranger, times = time_buckets)
+
+# Step 2: For each bucket, compute binary survived/not and C-index (or AUC)
+c_index_results <- data.frame(Time = time_buckets, C_index = NA)
+
+for (i in seq_along(time_buckets)) {
+  t <- time_buckets[i]
+  
+  # Define binary survival outcome at time t: 1 = survived beyond t, 0 = died before t
+  test_ranger <- test_ranger %>%
+    mutate(survived_t = ifelse(survival_days >= t & event == 0, 1, 0))
+  
+  # Predicted survival probabilities at time t
+  surv_prob_t <- bucket_surv_probs[, i]
+  
+  # Risk = 1 - survival probability
+  risk_score_t <- 1 - surv_prob_t
+  
+  # C-index for binary outcome at time t
+  # Use concordance() from survival
+  concord <- concordance(Surv(rep(1, nrow(test_ranger)), test_ranger$survived_t) ~ risk_score_t)
+  c_index_results$C_index[i] <- concord$concordance
+}
+
+# Step 3: Print results
+print(c_index_results)
+
+# plot
+ggplot(c_index_results, aes(x = factor(Time), y = C_index)) +
+  geom_col(fill = "#2E86C1", width = 0.6) +
+  geom_text(aes(label = round(C_index, 3)), vjust = -0.5, size = 5) +
+  labs(
+    title = "C-index by Survival Time Probability Prediction",
+    x = "Survival Time (Days)",
+    y = "C-index"
+  ) +
+  ylim(0, 1) +
+  theme_minimal(base_size = 15) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    axis.text = element_text(size = 12)
+  )
+```
+
+```{r}
+mean(c_index_results$C_index)
+```
+
+```{r}
+
 ```
 
 ## Ranger probability predictions for each interval

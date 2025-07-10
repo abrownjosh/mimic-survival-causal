@@ -1,0 +1,351 @@
+---
+title: "svm"
+format: html
+editor: visual
+---
+
+```{r}
+library(survivalsvm)
+library(survival)
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(data.table)
+library(quadprog)
+library(timeROC)
+library(pec)
+library(caret)
+library(stringr)
+
+# for C indices
+library(pROC)
+library(Hmisc)
+```
+
+## Setup (Import Imputed, Remove Pseudo-observational metrics, group ethnicities,
+
+```{r}
+sps <- fread("../data/sps_imputed.csv")
+
+# removing predictor matrices? (ask about this)
+sps <- sps %>% select(-starts_with("PO_"))
+
+sps <- sps %>% mutate(ethnicity = case_when(
+    str_detect(ethnicity, regex("ASIAN", ignore_case = TRUE)) ~ "Asian",
+    str_detect(ethnicity, regex("WHITE|MIDDLE", ignore_case = TRUE)) ~ "White",
+    str_detect(ethnicity, regex("BLACK", ignore_case = TRUE)) ~ "Black or African American",
+    str_detect(ethnicity, regex("OTHER|PATIENT|UNABLE|UNKNOWN", ignore_case = TRUE)) ~ "Unknown",
+    str_detect(ethnicity, regex("AMERICAN", ignore_case = TRUE)) ~ "American Indian or Alaska Native",
+    str_detect(ethnicity, regex("HISPANIC", ignore_case = TRUE)) ~ "Hispanic",
+    str_detect(ethnicity, regex("MULTI", ignore_case = TRUE)) ~ "More than one race",
+    TRUE ~ ethnicity
+  ))
+
+# categorical variables
+cat_vars <- c("gender", "admission_type", "insurance", "religion", "marital_status", "ethnicity", "discharge_location", "intervention.group", "language")
+
+
+# one-hot encode the categorical variables
+mm <- model.matrix(~ . - 1, data = sps[, ..cat_vars])
+
+# combining back with the rest of dataset
+sps <- cbind(sps[, !cat_vars, with = FALSE], as.data.table(mm))
+```
+
+## Train/Test Split
+
+```{r}
+set.seed(7)
+train_idx <- sample(seq_len(nrow(sps)), size = 0.6 * nrow(sps))
+train_data <- sps[train_idx, ]
+test_data <- sps[-train_idx, ]
+
+train_data_clean <- train_data %>%
+  select(-subject_id) %>%
+  mutate(across(where(is.character), as.factor))
+
+test_data_clean <- test_data %>%
+  select(-subject_id) %>%
+  mutate(across(where(is.character), as.factor))
+
+train_data_clean <- train_data_clean %>% filter(complete.cases(.))
+test_data_clean <- test_data_clean %>% filter(complete.cases(.))
+
+time_buckets <- c(7, 30, 60, 180, 365, 730)
+```
+
+```{r}
+# Define time buckets (e.g., 30, 60, 90 days)
+time_cutoffs <- c(7, 30, 60, 180, 365, 730)
+
+# Create binary survival targets for each bucket
+train_data_clean <- train_data_clean %>%
+  mutate(
+    survived_7 = ifelse(survival_days >= 7 & event == 0, 1, 0),
+    survived_30 = ifelse(survival_days >= 30 & event == 0, 1, 0),
+    survived_60 = ifelse(survival_days >= 60 & event == 0, 1, 0),
+    survived_180 = ifelse(survival_days >= 180 & event == 0, 1, 0),
+    survived_365 = ifelse(survival_days >= 365 & event == 0, 1, 0),
+    survived_730 = ifelse(survival_days >= 730 & event == 0, 1, 0)
+  )
+
+test_data_clean <- test_data_clean %>%
+  mutate(
+    survived_7 = ifelse(survival_days >= 7 & event == 0, 1, 0),
+    survived_30 = ifelse(survival_days >= 30 & event == 0, 1, 0),
+    survived_60 = ifelse(survival_days >= 60 & event == 0, 1, 0),
+    survived_180 = ifelse(survival_days >= 180 & event == 0, 1, 0),
+    survived_365 = ifelse(survival_days >= 365 & event == 0, 1, 0),
+    survived_730 = ifelse(survival_days >= 730 & event == 0, 1, 0)
+  )
+```
+
+```{r}
+svm_model <- survivalsvm(
+  formula = Surv(survival_days, event) ~ .,
+  data = train_data_clean %>% select(-starts_with("survived_")),
+  type = "regression",  # For continuous survival time prediction
+  gamma.mu = 0.5,
+  kernel = "lin_kernel"
+)
+
+# 3. Predict linear predictors (risk scores)
+svm_pred <- predict(svm_model, test_data_clean %>% select(-starts_with("survived_")))
+risk_scores <- svm_pred$predicted
+
+# 4. Estimate baseline survival function from Cox model (used for scaling)
+cox_baseline <- survfit(Surv(survival_days, event) ~ 1, data = train_data_clean)
+
+#5
+baseline_probs <- sapply(time_buckets, function(t) {
+  if (t < min(cox_baseline$time)) {
+    return(1.0)
+  } else if (t > max(cox_baseline$time)) {
+    return(min(cox_baseline$surv))  # Survival probably ~0
+  } else {
+    idx <- which.max(cox_baseline$time[cox_baseline$time <= t])
+    return(cox_baseline$surv[idx])
+  }
+})
+
+# Step 6: Compute survival probabilities
+centered_scores <- risk_scores - mean(risk_scores)
+surv_probs <- outer(centered_scores, baseline_probs, function(lp, s0) s0 ^ exp(lp))
+
+# Step 7: Convert to data frame and add to test_data_clean
+surv_probs_df <- as.data.frame(surv_probs)
+colnames(surv_probs_df) <- paste0("svm_surv_prob_", time_buckets)
+
+# 8. Preview
+head(test_data_clean %>%
+       select(survival_days, event, starts_with("svm_surv_prob_")), 10)
+```
+
+```{r}
+# 1. Time cutoffs for buckets
+time_cutoffs <- c(7, 30, 60, 180, 365, 730)
+
+# 2. Create a baseline survival curve from training data
+baseline_surv <- survfit(Surv(survival_days, event) ~ 1, data = train_data_clean)
+
+# 3. Extract risk scores
+risk_scores <- svm_pred$predicted
+risk_scores_centered <- risk_scores - mean(risk_scores)  # Centering is important
+
+# 4. Get baseline survival probabilities at each cutoff
+baseline_probs <- sapply(time_cutoffs, function(t) {
+  # Find the closest time point in the baseline curve
+  idx <- which.min(abs(baseline_surv$time - t))
+  baseline_surv$surv[idx]
+})
+
+# 5. Estimate individual survival probabilities
+surv_probs <- sapply(baseline_probs, function(S0_t) {
+  S0_t ^ exp(risk_scores_centered)
+})
+
+# surv_probs is a matrix: rows = individuals, columns = time cutoffs
+colnames(surv_probs) <- paste0("prob_surv_", time_cutoffs, "d")
+
+# 6. Add to test_data_clean
+test_data_clean <- cbind(test_data_clean, surv_probs)
+
+head(test_data_clean %>% 
+       select(starts_with("prob_surv_"), starts_with("pred_survive_")), 10)
+
+test_data_clean$survived_30_f <- factor(ifelse(test_data_clean$survived_30 == 1, "Likely", "Unlikely"))
+test_data_clean$pred_survive_30d_f <- factor(test_data_clean$pred_survive_30d, levels = c("Likely", "Unlikely"))
+
+# Step 2: Confusion Matrix at 30 Days
+cm_30 <- confusionMatrix(
+  data = test_data_clean$pred_survive_30d_f,
+  reference = test_data_clean$survived_30_f,
+  positive = "Likely"
+)
+print(cm_30)
+
+head(test_data_clean %>% 
+       select(starts_with("prob_surv_"), starts_with("pred_survive_")), 20)
+
+```
+
+## C-Index
+
+```{r}
+
+c_indices <- sapply(time_cutoffs, function(t) {
+  prob_col <- paste0("prob_surv_", t, "d")
+  status_col <- paste0("survived_", t)
+  
+  rc <- rcorr.cens(test_data_clean[[prob_col]], test_data_clean[[status_col]])
+  return(rc['C Index'])
+})
+
+# Print all
+names(c_indices) <- paste0("C-index_", time_cutoffs, "d")
+print(round(c_indices, 3))
+```
+
+```{r}
+
+auc_scores <- sapply(time_cutoffs, function(t) {
+  prob_col <- paste0("prob_surv_", t, "d")
+  status_col <- paste0("survived_", t)
+  roc_obj <- roc(test_data_clean[[status_col]], test_data_clean[[prob_col]], direction = ">")
+  return(as.numeric(roc_obj$auc))
+})
+
+names(auc_scores) <- paste0("AUC_", time_cutoffs, "d")
+print(round(auc_scores, 3))
+
+
+```
+
+```{r}
+surv_probs_mat <- as.matrix(surv_probs)
+colnames(surv_probs_mat) <- time_cutoffs  # Needed for Score()
+
+# 2. Compute IBS using Score()
+ibs_svm_result <- Score(
+  object = list("SurvivalSVM" = surv_probs_mat),
+  formula = Surv(survival_days, event) ~ 1,
+  data = test_data_clean,
+  times = time_cutoffs,
+  summary = "ibs",
+  cens.model = "km"
+)
+
+# 3. Extract IBS
+ibs_svm <- ibs_svm_result$Brier$score[ibs_svm_result$Brier$score$model == "SurvivalSVM", "IBS"]
+print(paste("Survival SVM IBS:", round(ibs_svm, 4)))
+```
+
+```{r}
+
+# 1. First create a custom prediction function for survivalsvm
+predictSurvProb.survivalsvm <- function(object, newdata, times, ...) {
+  # survivalsvm predicts survival times directly - we need to convert to probabilities
+  pred_times <- predict(object, newdata)$predicted
+  
+  # Create survival probability matrix (assuming exponential distribution)
+  surv_probs <- matrix(NA, nrow = nrow(newdata), ncol = length(times))
+  
+  for (i in seq_along(times)) {
+    surv_probs[, i] <- exp(-times[i]/pred_times)
+  }
+  
+  return(surv_probs)
+}
+
+# 2. Assign class to your model to enable method dispatch
+class(svm_model) <- c("survivalsvm", class(svm_model))
+
+ibs_result <- pec(
+  object = list("SVM" = svm_model),
+  formula = Surv(survival_days, event) ~ 1,
+  data = test_data_clean,
+  times = times,
+  cens.model = "cox",
+  exact = FALSE,
+  splitMethod = "none"
+)
+
+# 5. Extract and print IBS
+ibs_gbm <- crps(ibs_result)["SVM"]
+crps(ibs_result)
+```
+
+```{r}
+# Step 1: Ensure both columns are factors
+test_data_clean$survived_30_f <- factor(ifelse(test_data_clean$survived_30 == 1, "Survived", "Did Not Survive"))
+test_data_clean$pred_survive_30d_f <- factor(test_data_clean$pred_survive_30d, levels = c("Survived", "Did Not Survive"))
+
+# Step 2: Confusion Matrix at 30 Days
+cm_30 <- confusionMatrix(
+  data = test_data_clean$pred_survive_30d_f,
+  reference = test_data_clean$survived_30_f,
+  positive = "Survived"
+)
+print(cm_30)
+
+# Create table for 30-day CM
+cm_table_30 <- as.data.frame(table(
+  Predicted = test_data_clean$pred_survive_30d,
+  Actual = ifelse(test_data_clean$survived_30 == 1, "Survived", "Did Not Survive")
+))
+
+# Plot
+library(ggplot2)
+ggplot(cm_table_30, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 5) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Confusion Matrix: 30-Day Survival Prediction") +
+  theme_minimal()
+  
+```
+
+```{r}
+# Create time-binned predictions
+test_data_clean$svm_risk <- svm_pred$predicted
+
+# Compare with actual buckets
+results <- test_data_clean %>%
+  select(survival_days, event, starts_with("survived_"), svm_risk) %>%
+  mutate(
+    pred_30 = ifelse(svm_risk > quantile(svm_risk, 0.7), "High", "Low"),
+    pred_60 = ifelse(svm_risk > quantile(svm_risk, 0.5), "High", "Low"),
+    pred_90 = ifelse(svm_risk > quantile(svm_risk, 0.3), "High", "Low")
+  )
+```
+
+## C Index for SVM
+
+```{r}
+# Time-dependent ROC for 90-day survival
+roc_90 <- timeROC(
+  T = test_data_clean$survival_days,
+  cause = 1,
+  delta = test_data_clean$survived_90,
+  marker = -svm_pred$predicted, # Higher risk = lower survival
+  times = 90,
+  iid = TRUE
+)
+#plot(roc_90, time = 90, title = "90-Day Survival AUC")
+print(paste("90-Day AUC:", roc_90$AUC[2]))
+
+# Concordance index
+svm_concordance <- concordance(Surv(survival_days, event) ~ svm_risk, 
+                              data = test_data_clean)
+print(svm_concordance)
+```
+
+```{r}
+brier_scores <- brier$Brier
+brier_scores
+selected_times <- c(31.3250000, 60, 90)  # Adjust to your time points
+brier_at_times <- brier_scores[brier_scores$times %in% times, ]
+print(brier_at_times[, c("times", "Brier")])
+
+brier_at_times
+```

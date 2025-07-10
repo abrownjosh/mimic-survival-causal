@@ -1,0 +1,287 @@
+---
+title: "model_improv"
+format: html
+editor: visual
+---
+
+## imports
+
+```{r}
+library(data.table)
+library(mlr3)
+library(mlr3learners)
+library(mlr3measures)
+library(ggplot2)
+library(pec)
+library(survival)
+library(dplyr)
+library(randomForestSRC)
+library(survAUC) # concordance index
+library(stringr)
+library(mice)
+library(ranger)
+library(gbm)
+```
+
+## initial
+
+```{r}
+
+setup_sps = function(sps) {
+  
+  # removing predictor matrices? (ask about this)
+  sps <- sps %>% select(-starts_with("PO_"))
+  
+  sps <- sps %>% mutate(ethnicity = case_when(
+      str_detect(ethnicity, regex("ASIAN", ignore_case = TRUE)) ~ "Asian",
+      str_detect(ethnicity, regex("WHITE|MIDDLE", ignore_case = TRUE)) ~ "White",
+      str_detect(ethnicity, regex("BLACK", ignore_case = TRUE)) ~ "Black or African American",
+      str_detect(ethnicity, regex("OTHER|PATIENT|UNABLE|UNKNOWN", ignore_case = TRUE)) ~ "Unknown",
+      str_detect(ethnicity, regex("AMERICAN", ignore_case = TRUE)) ~ "American Indian or Alaska Native",
+      str_detect(ethnicity, regex("HISPANIC", ignore_case = TRUE)) ~ "Hispanic",
+      str_detect(ethnicity, regex("MULTI", ignore_case = TRUE)) ~ "More than one race",
+      TRUE ~ ethnicity
+    ))
+  
+  # categorical variables
+  cat_vars <- c("gender", "admission_type", "insurance", "religion", "marital_status", "ethnicity", "discharge_location", "intervention.group", "language")
+  
+  
+  # one-hot encode the categorical variables
+  mm <- model.matrix(~ . - 1, data = sps[, ..cat_vars])
+  
+  # combining back with the rest of dataset
+  sps <- cbind(sps[, !cat_vars, with = FALSE], as.data.table(mm))
+  
+  return(sps)
+}
+```
+
+## FILTER
+
+```{r}
+
+```
+
+## running
+
+```{r}
+
+run_rsf <- function(train_data_clean, test_data_clean) {
+  
+    # fit random survival forest
+    rsf_model <- rfsrc(Surv(survival_days, event) ~ ., data = train_data_clean)
+  
+    rsf_pred <- predict(rsf_model, newdata = test_data_clean)
+    
+    y_test <- Surv(test_data_clean$survival_days, test_data_clean$event)
+    
+    # risk score supposedly can be approximated as 1 - predicted survival probability at a fixed time (e.g., median), or use predicted mortality (1 - survival) at last time point
+    
+    # risk score: 1 - survival probability at max time point predicted
+    risk_scores <- 1 - rsf_pred$survival[, ncol(rsf_pred$survival)]
+    
+    rsf_pred <- predict(rsf_model, newdata = test_data_clean)
+    
+    rsf_cindex <- randomForestSRC::get.cindex(time = test_data_clean$survival_days,
+                                   censoring = test_data_clean$event,
+                                   predicted = -rsf_pred$predicted)
+    print(paste("RSF C-index:", round(rsf_cindex, 3)))
+}
+
+run_gbm <- function(train_data_clean, test_data_clean) {
+    # fit gradient boosting model (Cox PH boosting)
+    gbm_model <- gbm(Surv(survival_days, event) ~ ., 
+                     data = train_data_clean,
+                     distribution = "coxph",
+                     n.trees = 100)
+    
+    gbm_pred <- predict(gbm_model, newdata = test_data_clean, n.trees = 100)
+    
+    gbm_concordance <- concordance(y_test ~ gbm_pred)
+    if (gbm_concordance$concordance < 0.5) {
+      gbm_concordance$concordance <- 1 - gbm_concordance$concordance
+    }
+    
+    print(paste("GBM C-index:", round(gbm_concordance$concordance, 3))) 
+}
+
+
+run_ranger <- function(train_data_clean, test_data_clean, plot_var_imp) {
+  
+    clean_names <- function(df) {
+    names(df) <- gsub("[^[:alnum:]]", "_", names(df))
+    names(df) <- gsub("_+", "_", names(df))  # replace multiple _ with single
+    names(df) <- gsub("_$", "", names(df))   # remove trailing _
+    names(df) <- gsub("^_", "", names(df))   # remove leading _
+    df
+    }
+    
+    train_ranger <- train_data_clean %>% clean_names()
+    train_ranger <- train_ranger[complete.cases(train_ranger), ]
+    
+    test_ranger <- test_data_clean %>% clean_names()
+    
+    # Fit the ranger random survival forest
+    ranger_model <- ranger(
+      formula = Surv(survival_days, event) ~ .,
+      data = train_ranger,
+      num.trees = 1000,               # Number of trees
+      mtry = 8,                    # Number of variables to possibly split at (default is sqrt(p))
+      min.node.size = 9,             # Minimal node size
+      splitrule = "logrank",          # Splitting rule for survival
+      importance = "permutation",     # Variable importance mode
+      seed = 7,                       # For reproducibility
+      verbose = TRUE                  # Print progress
+    )
+    
+    # Print the model
+    #print(ranger_model)
+    
+    # Make predictions on test data
+    ranger_pred <- predict(
+      object = ranger_model,
+      data = test_ranger,
+      type = "response"  # Returns predicted survival times
+    )
+    
+    # You can also get survival probabilities at specific time points
+    # First get unique event times from training data
+    times <- sort(unique(train_ranger$survival_days[train_ranger$event == 1]))
+    
+    # Get survival probabilities at these times
+    ranger_surv <- predict(
+      object = ranger_model,
+      data = test_ranger,
+      type = "response",
+      fun = function(x) x$survival  # Returns survival probabilities
+    )
+    
+    # To get predicted survival probabilities at 90 days:
+    # Find the time point closest to 90 days
+    time_idx <- which.min(abs(times - 90))
+    surv_prob_90 <- ranger_surv$survival[, time_idx]
+    
+    # Variable importance
+    if (plot_var_imp) {
+      if (!is.null(ranger_model$variable.importance)) {
+      vi <- sort(ranger_model$variable.importance, decreasing = TRUE)
+      print(vi)
+      barplot(vi, las = 2, cex.names = 0.7, main = "Variable Importance")
+      } 
+    }
+    
+    predictSurvProb.ranger <- function(object, newdata, times, ...) {
+      pred <- predict(object, data = newdata)$survival
+      train_times <- object$unique.death.times
+      idx <- sapply(times, function(t) which.min(abs(train_times - t)))
+      surv_probs <- pred[, idx, drop = FALSE]
+      return(surv_probs)
+    }
+  
+    pred_surv <- predictSurvProb(ranger_model, newdata = test_ranger, times = times)
+    
+    # Predict survival probabilities at a fixed time, say 90 days
+    time_idx <- which.min(abs(times - 90))
+    surv_probs_90 <- predictSurvProb.ranger(ranger_model, test_ranger, times = times)[, time_idx]
+    
+    # Risk score as 1 - survival probability
+    risk_score <- surv_probs_90
+    
+    # Concordance index
+    conc <- concordance(Surv(test_ranger$survival_days, test_ranger$event) ~ risk_score)
+    print(paste("Ranger C-Index:", conc$concordance)) 
+}
+
+run_svm <- function(train_data_clean, test_data_clean) {
+  time_cutoffs <- c(30, 60, 90)
+
+  # Create binary survival targets for each bucket
+  train_data_clean <- train_data_clean %>%
+    mutate(
+      survived_30 = ifelse(survival_days >= 30 & event == 0, 1, 0),
+      survived_60 = ifelse(survival_days >= 60 & event == 0, 1, 0),
+      survived_90 = ifelse(survival_days >= 90 & event == 0, 1, 0)
+    )
+  
+  test_data_clean <- test_data_clean %>%
+    mutate(
+      survived_30 = ifelse(survival_days >= 30 & event == 0, 1, 0),
+      survived_60 = ifelse(survival_days >= 60 & event == 0, 1, 0),
+      survived_90 = ifelse(survival_days >= 90 & event == 0, 1, 0)
+    )
+  svm_model <- survivalsvm(
+    formula = Surv(survival_days, event) ~ .,
+    data = train_data_clean %>% select(-starts_with("survived_")),
+    type = "regression",  # For continuous survival time prediction
+    gamma.mu = 0.5,      # Tune these hyperparameters
+    kernel = "lin_kernel" # LIN KERNEL > RBF KERNEL, ADD KERNEL & POLY KERNEL DON'T WORK
+  )
+  
+  # Predict risk scores
+  svm_pred <- predict(svm_model, test_data_clean %>% select(-starts_with("survived_")))
+  
+  # Create time-binned predictions
+  test_data_clean$svm_risk <- svm_pred$predicted
+
+  # Compare with actual buckets
+  results <- test_data_clean %>%
+    select(survival_days, event, starts_with("survived_"), svm_risk) %>%
+    mutate(
+      pred_30 = ifelse(svm_risk > quantile(svm_risk, 0.7), "High", "Low"),
+      pred_60 = ifelse(svm_risk > quantile(svm_risk, 0.5), "High", "Low"),
+      pred_90 = ifelse(svm_risk > quantile(svm_risk, 0.3), "High", "Low")
+    )
+  
+  # Time-dependent ROC for 90-day survival
+  roc_90 <- timeROC(
+    T = test_data_clean$survival_days,
+    cause = 1,
+    delta = test_data_clean$survived_90,
+    marker = -svm_pred$predicted, # Higher risk = lower survival
+    times = 90,
+    iid = TRUE
+  )
+  #plot(roc_90, time = 90, title = "90-Day Survival AUC")
+  #print(paste("90-Day AUC:", roc_90$AUC[2]))
+  
+  # Concordance index
+  svm_concordance <- concordance(Surv(survival_days, event) ~ svm_risk, 
+                                data = test_data_clean)
+  print(paste("SVM C-Index:", svm_concordance$concordance))
+}
+```
+
+```{r}
+plot_var_imp <- T
+run_gbm(train_data_clean, test_data_clean)
+run_rsf(train_data_clean, test_data_clean)
+run_ranger(train_data_clean, test_data_clean, plot_var_imp)
+run_svm(train_data_clean, test_data_clean)
+```
+
+```{r}
+set.seed(7)
+sps <- fread("../data/sps_imputed.csv")
+sps <- setup_sps(sps)
+
+
+# sps <- sps %>% select(-starts_with(c("language", "diag_Missing", "comor_pud", "comor_vte", "proc_Endocrine")), languageENGL)
+
+
+
+train_idx <- sample(seq_len(nrow(sps)), size = 0.6 * nrow(sps))
+train_data <- sps[train_idx, ]
+test_data <- sps[-train_idx, ]
+
+train_data_clean <- train_data %>%
+  select(-subject_id) %>%
+  mutate(across(where(is.character), as.factor))
+
+test_data_clean <- test_data %>%
+  select(-subject_id) %>%
+  mutate(across(where(is.character), as.factor))
+
+train_data_clean <- train_data_clean %>% filter(complete.cases(.))
+test_data_clean <- test_data_clean %>% filter(complete.cases(.))
+```
