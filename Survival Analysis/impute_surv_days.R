@@ -3,9 +3,11 @@
 
 
                             #### HANRUI's CODE START####
+                            
+### clear everything                            
 rm(list = ls())
 
-
+# Load necessary libraries
 library(readr)
 library(stringr)
 library(mice)
@@ -13,6 +15,8 @@ library(dplyr)
 library(glmnet)
 library(Matrix)
 library(survival)
+
+# Set the working directory/ load in data                                                        
 data <- read.csv("C:/Users/qqkoo/OneDrive/Desktop/BDSI/ML_SOI_FINAL/merged_v4.csv")
 data <- data[,-1]
 
@@ -101,6 +105,7 @@ test_list  <- complete(imp_test , "all")
                     ### BC MICE DOESNT WORK W THIS
 ### ___________________________________________________________________________
 
+# Load necessary libraries
 pacman::p_load(dplyr, tidyr, haven, 
                survival, ggplot2, ggfortify, 
                survminer, viridis, pscl, 
@@ -109,12 +114,12 @@ pacman::p_load(dplyr, tidyr, haven,
                ggsurvfit, gdata, pseudo
 )
 
-
+# Load the imputed training dataset--first imputation
 dat <- complete(imp_train, 1)
 
 #dat = train_list[[1]]
 
-
+# Create a pseudonymized dataset for IT-MI
 dat_pseud <- dat %>%
   mutate(
     # Create sequential IDs
@@ -124,6 +129,7 @@ dat_pseud <- dat %>%
     # Create delta: 1 if event occurred, 0 if censored
     delta = ifelse(event == 0 & dbsource == "metavision", 0, 
                    ifelse(survival_days == 1460,1,event)),
+    ### Create new religion and language variables because of sample size
     newReligion = ifelse(religion == "CATHOLIC", "CATHOLIC",
                          ifelse(religion == "NOT SPECIFIED", "NOT SPECIFIED",
                                 ifelse(religion == "UNOBTAINABLE", "UNOBTAINABLE"
@@ -131,7 +137,7 @@ dat_pseud <- dat %>%
     newLang = ifelse(language == "ENGL", "ENGL", "OTHER")
   )
 
-
+# Create an ordered ID for the pseudonymized dataset
 dat_pseud$ord_ID = 1:nrow(dat_pseud)
 
 
@@ -139,7 +145,7 @@ dat_pseud$ord_ID = 1:nrow(dat_pseud)
 tp.interest = 1460
 
 
-
+# Create the model matrix for the covariates
 my_dat = model.matrix(~comor.cancer+
                         drug.Parkinsons.Dementia+
                         newLang+
@@ -155,8 +161,10 @@ my_dat = model.matrix(~comor.cancer+
 
 
 
-
+# Calculate the pseudomean for the observed survival time
 dat_pseud$po = pseudomean(dat_pseud$Xi, dat_pseud$delta, tmax=tp.interest)
+
+## fit linear model to get baseline model
 baseline.mod = lm(dat_pseud$po~.-1, as.data.frame(my_dat))
 # gets an unbiased estimate of min(Ti, tau) in the presence of censoring!!
 
@@ -172,14 +180,14 @@ source("C:/Users/qqkoo/Downloads/it_MI.R")
 
 
 
-
+# Prepare the variables for the IT-MI function
 n = nrow(dat_pseud)
 M = 5
 ID = dat_pseud$ord_ID
 Z = my_dat
   
   
-  
+
 X = dat_pseud$Xi
 T_t = matrix(dat_pseud[, "Xi"], nrow = n, ncol = 1)
 delta = matrix(dat_pseud[,"delta"], nrow = n, ncol = 1)
@@ -194,7 +202,7 @@ fitted.values = baseline.mod$coefficients
 
 
 
-
+### run the function
 MI5 = getMI(n, M, ID, Z, X, T_t, delta, fitted.values, tp.interest)
 View(cbind(T_t, delta,MI5[[1]],MI5[[2]])) # view the first two imputed dataset))
 # then you need to combine based on the SSIDs
@@ -203,9 +211,12 @@ View(cbind(T_t, delta,MI5[[1]],MI5[[2]])) # view the first two imputed dataset))
 # Each matrix corresponds to an imputed dataset.qaq2
 
 
+#### ^^ We now have five surv_days imputed datasets for the first MICE imputation
 
 
 
+### We will now combine the imputed datasets with the original dataset
+### Average the imputed survival days across the five imputed datasets & combine
 
 new1 = MI5[[1]]
 new1 = data.frame(new1)
