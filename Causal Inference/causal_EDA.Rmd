@@ -1,0 +1,662 @@
+---
+title: "test"
+output: html_document
+date: "2025-06-23"
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls())
+#clears the environment
+pacman::p_load(tidyverse, survival, survminer, ggplot2, dplyr, tidyr, readr, 
+               lubridate, ggthemes)
+# loads in necessary packages
+devtools::reload(pkgload::inst("dplyr"))
+```
+
+```{r}
+# =====================================================
+chart = read_csv("~/BDSI/Research/EDA/chart_events_6_23.csv")
+comorbid = read_csv("~/BDSI/Research/EDA/comorbidities_6_23.csv")
+rx = read_csv("~/BDSI/Research/EDA/rx_6_23.csv")#Prescriptions
+gcs.time = read_csv("~/BDSI/Research/EDA/gcs_over_time_6_23.csv")
+procedures = read_csv("~/BDSI/Research/EDA/procedures_6_16.csv")
+
+# chart = read_csv("~/BDSI/EDA/Old Data/chart_events_6_17.csv")
+# comorbid = read_csv("~/BDSI/EDA/Old Data/comorbidities_6_17.csv")
+# rx = read_csv("~/BDSI/EDA/Old Data/rx_6_17.csv")#Prescriptions
+# gcs.time = read_csv("~/BDSI/EDA/Old Data/gcs_over_time_6_17.csv")
+```
+
+
+```{r}
+length(unique(chart$subject_id))
+```
+
+
+```{r}
+# ======
+
+comorbid = comorbid %>% 
+  #str_detect is a useful function. Look up it's documentation!
+  mutate(diabetes = str_detect(diagnosis.long, "diabetes"),
+         hypertension = str_detect(diagnosis.long, "hypertension"),
+         heart.failure = str_detect(diagnosis.long, "heart failure"),
+         kidney.disease = str_detect(diagnosis.long, "kidney disease"),
+         hypothyroidism = str_detect(diagnosis.long, "hypothyroidism"),
+         )
+
+comorbid = comorbid %>% 
+  group_by(subject_id) %>% 
+  mutate(diabetes = any(diabetes),
+         hypertension = any(hypertension),
+         heart.failure = any(heart.failure),
+         kidney.disease = any(kidney.disease),
+         hypothyroidism = any(hypothyroidism))
+
+indicators = comorbid %>% 
+  select(subject_id, hadm_id, diabetes, hypertension, 
+         heart.failure, kidney.disease, hypothyroidism) %>% 
+  unique()
+```
+
+```{r}
+# =====
+
+chart.with.indicators = chart %>% 
+  left_join(indicators, by = c("subject_id", "hadm_id"))
+
+chart.with.indicators = chart.with.indicators %>% 
+  mutate(dischtime = parse_date_time(dischtime, orders = c("ymd HMS", "ymd")),
+         admittime = parse_date_time(admittime, orders = c("ymd HMS", "ymd")),
+         dob = parse_date_time(dob, orders = c( "ymd")),
+         dod = parse_date_time(dod, orders = c( "ymd")),
+         los = as.numeric(difftime(dischtime, admittime, units = "days")))
+```
+
+```{r}
+# ======
+
+chart.wide = chart.with.indicators %>% 
+  select( subject_id, hadm_id, gender, dischtime, admittime, dob, dod, los, dod_ssn,
+          diabetes, hypertension, heart.failure, kidney.disease, dod_hosp,
+          # your baseline variables of interest go here!
+          # selected from chart
+          marital_status, label, valuenum, intervention.group, ethnicity,
+          hypothyroidism, diagnosis, age.at.admit) %>% 
+  pivot_wider(names_from = label, values_from = valuenum, values_fill = NA,
+              values_fn = ~first(.x))
+
+
+```
+
+```{r}
+# =====
+# 90-day mortality indicator variable
+chart.wide = chart.wide %>% 
+  mutate(died = !is.na(dod))
+
+chart.wide = chart.wide %>% 
+  mutate(days.after.death = difftime(dod, dischtime, unit="days"),
+         died.before.90.days = (days.after.death <= 90))
+
+chart.wide = chart.wide %>%
+  mutate(died.before.90.days = replace_na(died.before.90.days, FALSE))
+
+chart.wide = chart.wide %>% 
+  arrange(subject_id) %>% 
+  distinct(subject_id, .keep_all = TRUE)
+
+# Add column for 90-day mortality (for clarity of visuals)
+chart.wide = chart.wide %>% 
+  mutate(mortality.90.days = ifelse(died.before.90.days, "Died", "Survived"))
+```
+
+```{r}
+# Intracranial indicator variable just based on "intracranial"
+chart.wide = chart.wide %>% 
+  mutate(intracranial = str_detect(diagnosis, "INTRACRANIAL"))
+
+# Intracranial based on "intracranial", "subarachnoid", "subdural", and "intraparenchymal"
+# Note "epidural" is part of "intracranial", but not present in the dataset
+chart.wide = chart.wide %>% 
+  mutate(subarachnoid = str_detect(diagnosis, "SAH") | str_detect(diagnosis, "SUBARACHNOID"),
+         subdural = str_detect(diagnosis, "SUBDURAL"),
+         intraparenchymal = str_detect(diagnosis, "INTRAPARENCHYMAL") | str_detect(diagnosis, "INTRAPARANCHYMAL")) %>%
+  mutate(intracranial.combined = intracranial | subarachnoid | subdural | intraparenchymal)
+
+chart.wide %>% filter(intracranial.combined == TRUE) %>% 
+  select(subject_id, diagnosis, intracranial.combined, intracranial, subarachnoid, subdural, intraparenchymal)
+```
+
+```{r}
+# Stroke (Transient Ischemic Attack) indicator variable
+chart.wide = chart.wide %>% 
+  mutate(ischemic = str_detect(diagnosis, "TIA") |
+                    str_detect(diagnosis, "ISCHEMIC"))
+```
+
+```{r}
+# Intracerebral indicator variable
+chart.wide = chart.wide %>% 
+  mutate(intracerebral = str_detect(diagnosis, "ICH"))
+```
+
+
+```{r}
+# Intracerebral indicator variable
+chart.wide = chart.wide %>% 
+  mutate(subarachnoid = str_detect(diagnosis, "ICH"))
+```
+
+```{r}
+# First measured GCS score
+gcs.unique = gcs.time %>% group_by(subject_id) %>%
+  arrange(charttime)%>%
+  filter(row_number()== 1) 
+  
+initial_gcs = gcs.unique %>%
+  arrange(subject_id, charttime) %>%
+  select(subject_id, hadm_id, valuenum)
+
+initial_gcs = rename(initial_gcs, gcs.initial = valuenum)
+  
+chart.wide = chart.wide %>%
+  left_join(initial_gcs, by = c("subject_id", "hadm_id"))
+
+chart.wide %>% select(subject_id, gcs.initial)
+```
+
+```{r}
+# Rename intervention group vars
+chart.wide = chart.wide %>%
+  mutate(intervention.group = recode(intervention.group, 
+                                     "craniotomy/craniectomy" = "Craniotomy/Craniectomy",
+                                     "nonsurgical" = "Nonsurgical",
+                                     "minimally_invasive_surg" = "Minimally Invasive Surgery"))
+```
+
+```{r}
+# Age outliers (censored data)
+chart.wide = chart.wide %>% 
+  mutate(age.at.admit = ifelse(age.at.admit > 120, 80, age.at.admit))
+```
+
+```{r}
+# Calculate BMI
+chart.wide = chart.wide %>% 
+  mutate(admit.weight.final = ifelse(is.na(`Admit Wt`), 
+                                     `Admission Weight (Kg)` * 2.2046,
+                                     `Admit Wt` * 2.2046)) %>% 
+  mutate(admit.weight.final = ifelse(is.na(admit.weight.final),
+                                     `Admission Weight (lbs.)`,
+                                     admit.weight.final))
+
+chart.wide = chart.wide %>% 
+  mutate(BMI = admit.weight.final * 703 / `Admit Ht` / `Admit Ht`,
+         BMI = ifelse(`Admit Ht` <= 10, NA, BMI))
+
+chart.wide %>% 
+  filter(!is.na(BMI)) %>% 
+  select(subject_id, admit.weight.final, `Admit Ht`, BMI)
+```
+
+# ==================================
+              ANALYSIS
+# ==================================
+
+```{r}
+# Number of patients with death before 90 days after discharge
+chart.wide %>% 
+  filter(died.before.90.days == TRUE) %>% 
+  nrow()
+
+# Number of total patients
+chart.wide %>% nrow()
+```
+
+```{r}
+# Plot for Distribution of Interventions
+chart.wide %>% 
+  ggplot() +
+  aes(x = intervention.group) +
+  geom_bar() +
+  labs(x = "Intervention Group",
+       y = "Count",
+       title = "Distribution of Interventions") +
+  scale_x_discrete(labels = c('Craniotomy/Craniectomy','Minimally Invasive Surgery','Nonsurgical'))
+```
+
+```{r}
+# Plot for Distribution of Intervention Group by 90-day Mortality
+
+chart.wide %>% 
+  ggplot() +
+  aes(x = intervention.group, fill = mortality.90.days) +
+  geom_bar(position = "fill") +
+  labs(x = "Intervention Group",
+       y = "Proportion",
+       title = "90-Day Mortality vs. Intervention Group",
+       fill = "90-Day Mortality") +
+  scale_x_discrete(labels = c('Craniotomy/Craniectomy','Minimally Invasive Surgery','Nonsurgical'))
+  
+```
+
+```{r}
+# Mortality rate
+mortality = chart.wide %>% 
+  group_by(intervention.group) %>% 
+  summarize(death.count = sum(died.before.90.days),
+            count = n(),
+            rate = death.count / count * 100)
+
+mortality
+```
+
+```{r}
+# Plotting mortality rate
+chart.wide %>% 
+  ggplot() +
+  aes(x = mortality.90.days,
+      fill = intervention.group) +
+  geom_bar(position = "dodge") + 
+  labs(x = "90 Day Mortality",
+       y = "Mortality Rate (proportion)",
+       title = "90 Day Mortality by Intervention",
+       fill = "Intervention") +
+  scale_fill_discrete(labels=c('Craniotomy/Craniectomy', 'Minimally Invasive Surgery', 'Nonsurgical'))
+```
+
+
+```{r}
+# BMI Distribution
+chart.wide %>% 
+  ggplot() +
+  aes(x = BMI) +
+  geom_histogram() +
+  labs(title = "Distribution of BMI",
+       subtitle = "for those with non-missing measurements")
+
+```
+
+```{r}
+# BMI
+chart.wide %>% 
+  ggplot() +
+  aes(x = BMI,
+      y = mortality.90.days) +
+  geom_boxplot() +
+  labs(title = "90-Day Mortality vs. BMI",
+       y = "90-Day Mortality") +
+  facet_wrap(vars(intervention.group))
+```
+
+```{r}
+# BMI vs Intervention
+chart.wide %>% 
+  ggplot() +
+  aes(x = BMI,
+      y = intervention.group) +
+  geom_boxplot() +
+  labs(title = "BMI vs Intervention",
+       x = "BMI",
+       y = "Intervention") +
+  scale_y_discrete(labels=c("Nonsurgical", "Minimally Invasive Surgery", "Craniotomy/Craniectomy"))
+```
+
+
+```{r}
+# Hypothyroidism
+chart.wide %>% 
+  filter(!is.na(hypothyroidism)) %>% 
+  ggplot() +
+  aes(x = hypothyroidism,
+      fill = mortality.90.days) +
+  geom_bar(position = "dodge") + 
+  facet_wrap(vars(intervention.group)) +
+  labs(title = "Mortality vs. Hypothyroidism Stratified by Treatment",
+       x = "Hypothyroidism",
+       y = "Count",
+       fill = "90-day Mortality") +
+  scale_x_discrete(labels=c("NO", "YES"))
+```
+
+```{r}
+# Hypothyroidism proportions
+chart.wide %>%
+  select(died.before.90.days, hypothyroidism) %>% 
+  group_by(hypothyroidism) %>%
+  summarise(count = n(), death.count = sum(died.before.90.days),
+            death.rate = death.count / count, survival.rate = 1 - death.rate) 
+```
+
+
+```{r}
+# Intracranial (note some data in "diagnosis" column is NA)
+# ================= OLD INTRACRANIAL ======================
+
+# chart.wide %>% 
+#   filter(!is.na(intracranial)) %>% 
+#   ggplot() +
+#   aes(x = intracranial,
+#       fill = mortality.90.days) +
+#   geom_bar(position = "dodge") +
+#   facet_wrap(vars(intervention.group)) +
+#   labs(x = "Intracranial Bleed Location",
+#        y = "Count",
+#        title = "90-Day Mortality vs Intracranial Bleeding",
+#        fill = "90-Day Mortality") +
+#   scale_x_discrete(labels=c("NO", "YES"))
+```
+
+```{r}
+# Intracranial proportions
+chart.wide %>%
+  select(died.before.90.days, intracranial.combined) %>% 
+  group_by(intracranial.combined) %>%
+  summarise(count = n(), death.count = sum(died.before.90.days),
+            death.rate = death.count / count, survival.rate = 1 - death.rate)
+```
+
+
+```{r}
+# Intracranial (combined)
+chart.wide %>% 
+  filter(!is.na(intracranial.combined)) %>%
+  ggplot() +
+  aes(x = intracranial.combined,
+      fill = mortality.90.days) +
+  geom_bar(position = "dodge") +
+  facet_wrap(vars(intervention.group)) +
+  labs(x = "Intracranial Bleeding",
+       y = "Count",
+       title = "Mortality vs Intracranial Bleeding Stratified by Treatment",
+       fill = "90-day Mortality") +
+  scale_x_discrete(labels=c("NO", "YES"))
+```
+
+
+```{r}
+# Diagnoses labels
+chart.wide %>% 
+  group_by(diagnosis) %>% 
+  summarize(count = n()) %>% 
+  arrange(desc(count))
+```
+
+```{r}
+# Initial GCS Score (distribution)
+chart.wide %>%
+  ggplot() +
+  aes(x = gcs.initial, fill = intervention.group) +
+  geom_density(alpha=0.5, width=1) +
+  labs(title = "Distribution of Initial GCS Scores Stratified by Treatment",
+       x = "Initial Glasgow Coma Test (GCS) Score",
+       y = "Density (within group)",
+       fill = "Treatment") +
+  scale_color_colorblind() +
+  theme_classic()
+```
+
+```{r}
+# Initial GCS Score (distribution)
+chart.wide %>% 
+  filter(intervention.group == "Nonsurgical") %>% 
+  ggplot() +
+  aes(x = gcs.initial,
+      fill = mortality.90.days,
+      width = ifelse(mortality.90.days == "Survived", 0.7, 0.3)) +
+  geom_histogram(alpha = 0.5) +
+  labs(title = "Distribution of Initial GCS Scores",
+       x = "Initial Glasgow Coma Test (GCS) Score",
+       fill = "90 Day Mortality")
+```
+
+```{r}
+# Age
+chart.wide %>% 
+  ggplot() +
+  aes(x = age.at.admit, fill = intervention.group) +
+  geom_density(alpha=0.5) +
+  labs(title = "Distribution of Age Stratified by Treatment",
+       x = "Age at Admit",
+       y = "Density (within group)",
+       fill = "Treatment") +
+  scale_color_colorblind() +
+  theme_classic() +
+  theme(,
+    legend.title = element_text(size = 16),
+    title = element_text(size = 20),
+    axis.text = element_text(size = 16),
+    
+  )
+```
+
+
+```{r}
+# Initial GCS (facet by intervention)
+chart.wide %>% 
+  ggplot() +
+  aes(x = gcs.initial,
+      y = mortality.90.days) +
+  geom_boxplot() +
+  labs(title = "90-Day Mortality vs Initial GCS Score",
+       x = "Initial GCS Score",
+       y = "90-Day Mortality") +
+  facet_wrap(vars(intervention.group))
+
+t.test(chart.wide$gcs.initial, chart.wide$died.before.90.days)
+```
+
+```{r}
+# Initial GCS
+chart.wide %>% 
+  ggplot() +
+  aes(x = gcs.initial,
+      y = intervention.group) + 
+  geom_boxplot() +
+  labs(title = "Initial GCS Score vs Intervention",
+       x = "Initial GCS Score",
+       y = "Intervention") +
+  scale_y_discrete(labels=c("Nonsurgical", "Minimally Invasive Surgery", "Craniotomy/Craniectomy"))
+```
+
+```{r}
+# Stroke (TIA)
+chart.wide %>% 
+  filter(!is.na(ischemic)) %>% 
+  ggplot() +
+  aes(x = ischemic,
+      fill = mortality.90.days) +
+  geom_bar(position = "dodge") +
+  labs(title = "Mortality vs. Stroke (Transient Ischemic Attack) Stratified by Treatment",
+       x = "Stroke (TIA)",
+       y = "Count",
+       fill = "90-day Mortality") +
+  facet_wrap(vars(intervention.group)) +
+  scale_x_discrete(labels=c("NO", "YES"))
+```
+
+```{r}
+# TIA proportions
+chart.wide %>%
+  select(died.before.90.days, ischemic) %>% 
+  group_by(ischemic) %>%
+  summarise(count = n(), death.count = sum(died.before.90.days),
+            death.rate = death.count / count, survival.rate = 1 - death.rate)
+
+```
+
+```{r}
+# Diabetes
+chart.wide %>% 
+  filter(!is.na(diabetes)) %>% 
+  ggplot() +
+  aes(x = diabetes,
+      fill = mortality.90.days) +
+  geom_bar(position = "dodge") +
+  labs(title = "Mortality vs. Diabetes Stratified by Treatment",
+       x = "Diabetes",
+       y = "Count",
+       fill = "90-day Mortality") +
+  facet_wrap(vars(intervention.group)) +
+  scale_x_discrete(labels=c("NO", "YES"))
+
+```
+
+```{r}
+# Hypertension
+chart.wide %>% 
+  filter(!is.na(hypertension)) %>% 
+  ggplot() +
+  aes(x = hypertension,
+      fill = mortality.90.days) +
+  geom_bar(position = "dodge") +
+  labs(title = "Mortality vs. Hypertension Stratified by Treatment",
+       x = "Hypertension",
+       y = "Count",
+       fill = "90-day Mortality") +
+  facet_wrap(vars(intervention.group)) +
+  scale_x_discrete(labels=c("NO", "YES"))
+
+
+```
+
+```{r}
+# Kidney Disease
+chart.wide %>% 
+  filter(!is.na(kidney.disease)) %>% 
+  ggplot() +
+  aes(x = kidney.disease,
+      fill = mortality.90.days) +
+  geom_bar(position = "dodge") +
+  labs(title = "Mortality vs. Kidney Disease Stratified by Treatment",
+       x = "Kidney Disease",
+       y = "Count",
+       fill = "90-day Mortality") +
+  facet_wrap(vars(intervention.group)) +
+  scale_x_discrete(labels=c("NO", "YES"))
+```
+
+```{r}
+# Heart Failure
+chart.wide %>% 
+  filter(!is.na(heart.failure)) %>% 
+  ggplot() +
+  aes(x = heart.failure,
+      fill = mortality.90.days) +
+  geom_bar(position = "dodge") +
+  labs(title = "Mortality vs. Heart Failure Stratified by Treatment",
+       x = "Heart Failure",
+       y = "Count",
+       fill = "90-day Mortality") +
+  facet_wrap(vars(intervention.group)) +
+  scale_x_discrete(labels=c("NO", "YES"))
+```
+
+
+```{r}
+# Gender
+chart.wide %>% 
+  filter(!is.na(gender)) %>% 
+  ggplot() +
+  aes(x = gender,
+      fill = mortality.90.days) +
+  geom_bar(position = "dodge") +
+  labs(title = "Mortality vs. Gender Stratified by Treatment",
+       x = "Gender",
+       y = "Count",
+       fill = "90-day Mortality") +
+  facet_wrap(vars(intervention.group)) #+
+  # scale_x_discrete(labels=c("NO", "YES"))
+```
+
+
+
+
+```{r}
+# Across comorbidities
+temp = chart.wide %>% 
+  pivot_longer(
+    cols = c("hypertension", "diabetes", "intracranial.combined", "ischemic",
+             "kidney.disease", "hypothyroidism", "heart.failure"),
+    names_to = "comorbidity.name",
+    values_to = "comorbidity.status"
+  ) %>% 
+  filter(comorbidity.status == TRUE)
+
+temp %>% 
+  ggplot() +
+  aes(x = comorbidity.name, fill = mortality.90.days) +
+  geom_bar(position = "fill") +
+  labs(y = "Proportion", 
+       x = "Covariate",
+       title = "90-day Mortality vs. Covariates",
+       fill = "90-day Mortality") +
+  scale_x_discrete(labels = c(
+    hypertension = "Hypertension",
+    diabetes = "Diabetes",
+    intracranial.combined = "Intracranial Bleeding",
+    ischemic = "Stroke (Transient Ischemic Attack)",
+    kidney.disease = "Kidney Disease",
+    hypothyroidism = "Hypothyroidism",
+    heart.failure = "Heart Failure"
+    )
+  ) +
+  coord_flip()
+```
+
+```{r}
+chart.wide %>% 
+  ggplot() +
+  aes(x = SpO2,
+      fill = mortality.90.days) +
+  geom_density() +
+  facet_wrap(vars(intervention.group))
+```
+
+```{r}
+chart.wide %>%
+  filter(intervention.group == "Nonsurgical") %>%
+  ggplot(aes(x = gcs.initial, fill = mortality.90.days)) +
+  geom_histogram(
+    binwidth = 1,
+    alpha = 0.5,
+    position = "dodge"
+  ) +
+  facet_wrap(vars(intervention.group)) +
+  labs(
+    title = "Distribution of Initial GCS Scores for Nonsurgical Patients",
+    x = "Initial Glasgow Coma Scale (GCS) Score",
+    fill = "90 Day Mortality"
+  )
+```
+
+```{r}
+chart.wide %>%
+  filter(intervention.group != "Nonsurgical") %>%
+  ggplot(aes(x = gcs.initial, fill = mortality.90.days)) +
+  geom_histogram(
+    binwidth = 1,
+    alpha = 0.5,
+    position="dodge"
+  ) +
+  facet_wrap(vars(intervention.group)) +
+  labs(
+    title = "Distribution of Initial GCS Scores Stratified by Intervention",
+    x = "Initial Glasgow Coma Scale (GCS) Score",
+    fill = "90 Day Mortality"
+  )
+```
+```{r}
+names(chart.wide)
+
+# WBC (4-11,000), Hemoglobin, Hematocrit, INR, PT, PTT, Glucose, RUE Temp,
+# Mean Airway Pressure, Creatinine, BUN, ICP, Platelet Count, Sodium (serum),
+# Potassium (serum), 
+```
+
+
+```{r}
+write.csv(chart.wide, "~/BDSI/chart_wide.csv")
+```

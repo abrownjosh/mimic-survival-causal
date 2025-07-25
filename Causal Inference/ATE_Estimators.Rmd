@@ -1,0 +1,177 @@
+---
+title: "ATE Estimators"
+output: html_document
+date: "2025-07-07"
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls())
+#clears the environment
+pacman::p_load(tidyverse, survival, survminer, ggplot2, dplyr, tidyr, readr, 
+               lubridate, randomForest, rattle, RColorBrewer)
+# loads in necessary packages
+devtools::reload(pkgload::inst("dplyr"))
+```
+
+
+```{r}
+# IPW Estimator 
+propensity = read_csv("~/BDSI/Research/propensity_scores.csv")
+observed = read_csv("~/BDSI/Research/observed.csv")
+
+full.data = full_join(propensity, observed) %>% 
+  rename(cranio.prop = `Craniotomy/Craniectomy`)
+
+full.data = full.data %>% 
+  rename(min.inv.surg.prop = `Minimally Invasive Surgery`)
+  
+full.data = full.data %>% 
+  mutate(treatment = ifelse(intervention.group == "Nonsurgical", 0,
+                            ifelse(intervention.group == 
+                                     "Craniotomy/Craniectomy", 1, 2)),
+         survived = ifelse(died.before.90.days, 1, 0))
+## Craniotomy/Craniectomy
+
+cranio = full.data %>% filter(treatment != 2) %>% 
+  filter(cranio.prop > 0)
+
+cranio = cranio %>% 
+  mutate(ipw1 = treatment / cranio.prop * survived
+         - (1 - treatment) / (1 - cranio.prop) * survived)
+
+## Minimally Invasive Surgery
+
+m.i.s = full.data %>% filter(treatment != 1) %>% 
+  mutate(treatment = ifelse(treatment == 2, 1, treatment)) %>% 
+  filter(min.inv.surg.prop > 0)
+
+m.i.s = m.i.s %>% 
+  mutate(ipw2 = treatment / min.inv.surg.prop * survived
+         - (1 - treatment) / (1 - min.inv.surg.prop) * survived)
+
+# Results
+ate.est1 <- mean(cranio$ipw1)
+ate.se1 <- sd(cranio$ipw1) / sqrt(length(cranio$ipw1))
+ate.tstat1 <- ate.est1 / ate.se1
+ate.pvalue1 <- 2*(pnorm(1 - abs(ate.est1/ate.se1)))
+ate.results1 <- c(estimate=ate.est1, std.error=ate.se1, t.stat=ate.tstat1, pvalue=ate.pvalue1)
+
+ate.est2 <- mean(m.i.s$ipw2)
+ate.se2 <- sd(m.i.s$ipw2) / sqrt(length(m.i.s$ipw2))
+ate.tstat2 <- ate.est2 / ate.se2
+ate.pvalue2 <- 2*(pnorm(1 - abs(ate.est2/ate.se2)))
+ate.results2 <- c(estimate=ate.est2, std.error=ate.se2, t.stat=ate.tstat2, pvalue=ate.pvalue2)
+
+ate.results1
+ate.results2
+```
+
+
+```{r}
+# AIPW Estimator 
+
+propensity = read_csv("~/BDSI/Research/propensity_scores.csv",
+                      show_col_types = FALSE)
+# Change model if needed
+# outcomes = read_csv("~/BDSI/Research/outcomes_xg.csv")
+# outcomes = read_csv("~/BDSI/Research/outcomes_lr.csv")
+# outcomes = read_csv("~/BDSI/Research/combined_predictions.csv") 
+outcomes = read_csv("~/BDSI/Research/outcome_fix2.csv",
+                    show_col_types = FALSE) %>% 
+  rename(X = "...1") %>% 
+  rename(cranio.outcome = cranio) %>% 
+  rename(nonsurg.outcome = nonsurgical) %>% 
+  rename(m.i.s.outcome = minimal)
+observed = read_csv("~/BDSI/Research/observed.csv",
+                    show_col_types = FALSE)
+
+full.data = full_join(propensity, observed) %>%
+  full_join(outcomes) %>% 
+  rename(cranio.prop = `Craniotomy/Craniectomy`)
+
+full.data = full.data %>% 
+  rename(min.inv.surg.prop = `Minimally Invasive Surgery`)
+  
+full.data = full.data %>% 
+  mutate(treatment = ifelse(intervention.group == "Nonsurgical", 0,
+                            ifelse(intervention.group == 
+                                     "Craniotomy/Craniectomy", 1, 2)),
+         survived = ifelse(died.before.90.days, 1, 0))
+
+# cranio = full.data %>% filter(treatment != 2)
+
+cranio = full.data %>% 
+  mutate(aipw1 = cranio.outcome - nonsurg.outcome
+         + ifelse(treatment == 1, 1, 0) / cranio.prop * (survived - cranio.outcome)
+         - ifelse(treatment == 0, 1, 0) / (1 - cranio.prop) * (survived - nonsurg.outcome))
+
+## Minimally Invasive Surgery
+
+# m.i.s = full.data %>% #filter(treatment != 1) %>%
+#   mutate(treatment = ifelse(treatment == 2, 1, treatment))
+
+m.i.s = full.data %>% 
+  mutate(aipw2 = m.i.s.outcome - nonsurg.outcome
+         + ifelse(treatment == 2, 1, 0) / min.inv.surg.prop * (survived - m.i.s.outcome)
+         - ifelse(treatment == 0, 1, 0) / (1 - min.inv.surg.prop) * (survived - nonsurg.outcome))
+
+# Results
+ate.aipw.est1 = mean(cranio$aipw1)
+ate.aipw.se1 = sd(cranio$aipw1) / sqrt(nrow(cranio))
+ate.aipw.tstat1 = ate.aipw.est1 / ate.aipw.se1
+ate.aipw.pvalue1 = 2*(pnorm(1 - abs(ate.aipw.tstat1)))
+ate.aipw.results1 = c(estimate=ate.aipw.est1, std.error=ate.aipw.se1, 
+                      t.stat=ate.aipw.tstat1, pvalue=ate.aipw.pvalue1)
+
+ate.aipw.est2 = mean(m.i.s$aipw2)
+ate.aipw.se2 = sd(m.i.s$aipw2) / sqrt(nrow(m.i.s))
+ate.aipw.tstat2 = ate.aipw.est2 / ate.aipw.se2
+ate.aipw.pvalue2 = 2*(pnorm(1 - abs(ate.aipw.tstat2)))
+ate.aipw.results2 = c(estimate=ate.aipw.est2, std.error=ate.aipw.se2, 
+                      t.stat=ate.aipw.tstat2, pvalue=ate.aipw.pvalue2)
+
+ate.aipw.results1
+ate.aipw.results2
+```
+
+```{r}
+robust.nonsurg.outcomes1 = full.data$nonsurg.outcome +
+  (ifelse(full.data$treatment == 0, 1, 0) / 
+   (1 - full.data$cranio.prop) * 
+   (full.data$survived - full.data$nonsurg.outcome))
+
+robust.nonsurg.outcomes2 = full.data$nonsurg.outcome +
+  (ifelse(full.data$treatment == 0, 1, 0)/ 
+   (1 - full.data$min.inv.surg.prop) * 
+   (full.data$survived - full.data$nonsurg.outcome))
+
+# robust.nonsurg.outcomes1
+# robust.nonsurg.outcomes2
+```
+
+
+```{r}
+total.mortality = outcomes %>% 
+  filter(nonsurg.outcome == 1) %>% 
+  nrow()
+total.mortality / nrow(outcomes)
+
+summary(robust.nonsurg.outcomes1)
+summary(robust.nonsurg.outcomes2)
+
+robust.nonsurg.outcomes1[robust.nonsurg.outcomes1 > 0.5] %>% 
+  length() / length(robust.nonsurg.outcomes1)
+
+robust.nonsurg.outcomes2[robust.nonsurg.outcomes2 > 0.5] %>% 
+  length() / length(robust.nonsurg.outcomes2)
+```
+
+```{r}
+m.i.s %>% 
+  arrange(desc(aipw2))
+
+summary(cranio$aipw1)
+summary(m.i.s$aipw2)
+```
+

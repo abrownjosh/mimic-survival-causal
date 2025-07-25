@@ -1,0 +1,499 @@
+---
+title: "Propensity Model"
+output: html_document
+date: "2025-07-03"
+---
+
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls())
+#clears the environment
+pacman::p_load(tidyverse, survival, survminer, ggplot2, dplyr, tidyr, readr, 
+               lubridate, randomForest, rattle, RColorBrewer, cobalt,
+               pROC, ROCR)
+```
+
+```{r}
+set.seed(2025)
+data = read.csv("~/BDSI/Research/imputed6.csv")
+
+X.rows = data$X
+patients = data %>% select(X, intervention.group, died.before.90.days)
+
+write_csv(patients, "~/BDSI/Research/observed.csv")
+
+patients = patients %>% select(X, intervention.group)
+
+patients1 = patients %>% 
+  filter(intervention.group != "Minimally Invasive Surgery")
+patients2 = patients %>% 
+  filter(intervention.group != "Craniotomy/Craniectomy")
+
+data = data %>% select(-X, -died.before.90.days)
+
+data = data %>% 
+  select(age.at.admit, SpO2, Respiratory.Rate, gcs.initial, wbc, hemoglobin, 
+         platelet, hematocrit, INR, PT, PTT, glucose, mean.airway.pressure, 
+         creatinine,sodium, potassium, hypertension, heart.failure, anemia,
+         airway.obstruction, liver.disease, depressive.disorder, subarachnoid,
+         intervention.group)
+
+data1 = data %>% 
+  filter(intervention.group != "Minimally Invasive Surgery") %>% 
+  mutate(intervention.group = factor(intervention.group))
+
+data2 = data %>% 
+  filter(intervention.group != "Craniotomy/Craniectomy") %>% 
+  mutate(intervention.group = factor(intervention.group))
+```
+
+```{r}
+# Logistic Regression
+library(glmnet)
+
+y1 = ifelse(data1$intervention.group == "Nonsurgical", 0, 1)
+x1 = model.matrix(intervention.group ~ . , data = data1)[, -1]
+fit1 = cv.glmnet(x1, y1, family = "binomial", alpha = 1)
+lambda1 = fit1$lambda.min
+
+y2 = ifelse(data2$intervention.group == "Nonsurgical", 0, 1)
+x2 = model.matrix(intervention.group ~ ., data = data2)[, -1]
+fit2 = cv.glmnet(x2, y2, family = "binomial", alpha = 1)
+lambda2 = fit2$lambda.min
+
+predict1 = predict(fit1, newx = x1, type = "response", s = lambda1)
+predict2 = predict(fit2, newx = x2, type = "response", s = lambda2)
+```
+
+```{r}
+coef(fit1, fit1$lambda.1se)
+coef(fit2, fit2$lambda.1se)
+```
+
+```{r}
+predict.df1 = as.data.frame(predict1) %>% 
+  mutate(X = patients1$X) %>% 
+  rename(`Craniotomy/Craniectomy` = s0) %>% 
+  left_join(patients1)
+predict.df2 = as.data.frame(predict2) %>% 
+  mutate(X = patients2$X) %>% 
+  rename(`Minimally Invasive Surgery` = s0) %>% 
+  left_join(patients2)
+
+# Plotting the predicted probabilities
+predict.df1 %>% 
+  ggplot() +
+  aes(x = `Craniotomy/Craniectomy`, fill = patients1$intervention.group) +
+  geom_histogram(binwidth = 0.05, position = "identity", alpha = 0.5) +
+  labs(title = "Distribution of Propensity Scores (Craniotomy/Craniectomy)",
+       x = "Propensity Score",
+       y = "Count",
+       fill = "Intervention")
+
+predict.df2 %>% 
+  ggplot() +
+  aes(x = `Minimally Invasive Surgery`, fill = patients2$intervention.group) +
+  geom_histogram(binwidth = 0.05, position = "identity", alpha = 0.5) +
+  labs(title = "Distribution of Propensity Scores (Minimally Invasive Surgery)",
+       x = "Propensity Score",
+       y = "Count",
+       fill = "Intervention")
+
+# Proportions (within group)
+predict.df1 %>% 
+  ggplot() +
+  aes(x = `Craniotomy/Craniectomy`, fill = patients1$intervention.group) +
+  geom_histogram(binwidth = 0.05, position = "identity", alpha = 0.5,
+                 aes(y = ..density..)) +
+  labs(title = "Distribution of Propensity Scores (Craniotomy/Craniectomy)",
+       x = "Propensity Score",
+       y = "Percent (within group)",
+       fill = "Treatment") +
+  scale_color_colorblind() +
+  theme_classic() +
+  theme(
+        title = element_text(size = 14.5),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 14),
+        axis.text = element_text(size = 14),
+        axis.title = element_text(size = 16)
+      ) 
+
+nonsurg.count2 = predict.df2 %>% 
+  filter(intervention.group == "Nonsurgical") %>% 
+  nrow()
+min.count2 = predict.df2 %>% 
+  filter(intervention.group == "Minimally Invasive Surgery") %>% 
+  nrow()
+
+predict.df2 %>% 
+  ggplot() +
+  aes(x = `Minimally Invasive Surgery`, fill = patients2$intervention.group) +
+  geom_histogram(binwidth = 0.05, position = "identity", alpha = 0.5,
+                 aes(y = ..density..)) +
+  labs(title = "Distribution of Propensity Scores (Minimally Invasive Surgery)",
+       x = "Propensity Score",
+       y = "Percent (within group)",
+       fill = "Treatment") +
+  # facet_wrap(vars(intervention.group)) +
+  scale_color_colorblind() +
+  theme_classic() +
+  theme(
+        title = element_text(size = 14.5),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 14),
+        axis.text = element_text(size = 14),
+        axis.title = element_text(size = 16)
+      ) +
+  scale_x_continuous(breaks=seq(0,1,0.2))
+  
+```
+
+```{r}
+new_labels <- c(
+  "age.at.admit*" = "Age*",
+  "hemoglobin*" = "Hemoglobin",
+  "hematocrit*" = "Hematocrit",
+  "SpO2*" = "Oxygen Saturation",
+  "Respiratory.Rate*" = "Respiratory Rate",
+  "gcs.initial*" = "GCS (Initial)",
+  "sodium*" = "Sodium",
+  "INR" = "INR",
+  "subarachnoid" = "Subarachnoid",
+  "wbc*" = "White Blood Cell Count",
+  "creatinine*" = "Creatinine",
+  "mean.airway.pressure*" = "Mean Airway Pressure",
+  "hypertension" = "Hypertension",
+  "depressive.disorder" = "Depressive Disorder",
+  "glucose*" = "Glucose",
+  "potassium*" = "Potassium",
+  "platelet*" = "Platelet Count",
+  "heart.failure" = "Heart Failure",
+  "anemia" = "Anemia",
+  "airway.obstruction" = "Airway Obstruction",
+  "liver.disease" = "Liver Disease",
+  "PT*" = "PT",
+  "PTT*" = "PTT",
+  "INR*" = "INR"
+)
+```
+
+
+```{r}
+treat1 <- data1$intervention.group
+
+weights1 <- ifelse(treat1 == "Craniotomy/Craniectomy",
+                  1 / predict1,
+                  1 / (1 - predict1))
+
+bal1 = bal.tab(intervention.group ~ age.at.admit + SpO2 + Respiratory.Rate + 
+                gcs.initial + wbc + hemoglobin + platelet + hematocrit + INR +
+                PT + PTT + glucose + mean.airway.pressure + creatinine + sodium
+              + potassium + hypertension + heart.failure + anemia +
+                airway.obstruction + liver.disease + depressive.disorder
+              + subarachnoid,
+              data = data1, 
+              weights = weights1,
+              method = "weighting",
+              un = TRUE)
+
+
+lp1 = love.plot(bal1, estimand = "ATE", abs = TRUE, var.order = "adj", stars = "std",
+          title = "Covariate Balance (Craniotomy/Craniectomy and Nonsurgical)",
+          grid = FALSE, shapes = c(16, 17), colors = (c("red", "blue")),
+          thresholds = c(0.2)) +
+      theme(
+        title = element_text(size = 15),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 14),
+        axis.text = element_text(size = 12)
+      ) +
+      labs(x  = "Absolute Standardized Mean Differences") +
+      scale_y_discrete(labels = new_labels) +
+      scale_x_continuous(breaks=seq(0,1,0.2))
+lp1
+
+new_labels <- c(
+  "age.at.admit*" = "Age",
+  "hemoglobin*" = "Hemoglobin",
+  "hematocrit*" = "Hematocrit",
+  "SpO2*" = "Oxygen Saturation",
+  "Respiratory.Rate*" = "Respiratory Rate",
+  "gcs.initial*" = "GCS (Initial)",
+  "sodium*" = "Sodium",
+  "INR" = "INR",
+  "subarachnoid" = "Subarachnoid",
+  "wbc*" = "White Blood Cell Count",
+  "creatinine*" = "Creatinine",
+  "mean.airway.pressure*" = "Mean Airway Pressure",
+  "hypertension" = "Hypertension",
+  "depressive.disorder" = "Depressive Disorder",
+  "glucose*" = "Glucose",
+  "potassium*" = "Potassium",
+  "platelet*" = "Platelet Count",
+  "heart.failure" = "Heart Failure",
+  "anemia" = "Anemia",
+  "airway.obstruction" = "Airway Obstruction",
+  "liver.disease" = "Liver Disease",
+  "PT*" = "PT",
+  "PTT*" = "PTT",
+  "INR*" = "INR"
+)
+
+treat2 <- data2$intervention.group
+
+weights2 <- ifelse(treat2 == "Minimally Invasive Surgery",
+                  1 / predict2,
+                  1 / (1 - predict2))
+
+bal2 = bal.tab(intervention.group ~ age.at.admit + SpO2 + Respiratory.Rate + 
+                gcs.initial + wbc + hemoglobin + platelet + hematocrit + INR +
+                PT + PTT + glucose + mean.airway.pressure + creatinine + sodium
+              + potassium + hypertension + heart.failure + anemia +
+                airway.obstruction + liver.disease + depressive.disorder
+              + subarachnoid,
+              data = data2, 
+              weights = weights2,
+              method = "weighting",
+              un = TRUE)
+
+
+
+lp2 = love.plot(bal2, estimand = "ATE", abs = TRUE, var.order = "adj", stars = "std",
+          title = "Covariate Balance (Minimally Invasive Surgery and Nonsurgical)",
+          grid = FALSE, shapes = c(16, 17), colors = (c("red", "blue")),
+          thresholds = c(0.2)) +
+      theme(
+        title = element_text(size = 15),
+        legend.title = element_text(size = 14),
+        legend.text = element_text(size = 14),
+        axis.text = element_text(size = 12)
+      ) +
+      labs(x  = "Absolute Standardized Mean Differences") +
+      scale_y_discrete(labels = new_labels) +
+      scale_x_continuous(breaks=seq(0,1,0.2))
+lp2
+```
+
+```{r}
+pred1 = prediction(predict1, y1)
+auc1 = performance(pred1, measure = "auc")@y.values[[1]]
+auc1
+
+pred2 = prediction(predict2, y2)
+auc2 = performance(pred2, measure = "auc")@y.values[[1]]
+auc2
+
+table(predict.df1$`Craniotomy/Craniectomy` < 0.02 | 
+        predict.df1$`Craniotomy/Craniectomy` > 0.98)/nrow(predict1)
+table(predict.df2$`Minimally Invasive Surgery` < 0.02 | 
+        predict.df2$`Minimally Invasive Surgery` > 0.98)/nrow(predict2)
+```
+
+```{r}
+x = model.matrix(intervention.group ~ . , data = data)[, -1]
+predict1full = predict(fit1, newx = x, type = "response", s = lambda1)
+predict2full = predict(fit2, newx = x, type = "response", s = lambda2)
+
+predict1full.df = as.data.frame(predict1full) %>% 
+  mutate(X = X.rows) %>% 
+  rename(`Craniotomy/Craniectomy` = s0)
+predict1full.df = predict1full.df %>% 
+  left_join(patients)
+
+predict2full.df = as.data.frame(predict2full) %>% 
+  mutate(X = X.rows) %>% 
+  rename(`Minimally Invasive Surgery` = s0)
+predict2full.df = predict2full.df %>% 
+  left_join(patients)
+
+predictfull.df = full_join(predict1full.df, predict2full.df) %>% 
+  select(X, `Craniotomy/Craniectomy`, `Minimally Invasive Surgery`)
+
+write_csv(predictfull.df, "~/BDSI/Research/propensity_scores.csv")
+```
+
+```{r}
+# Weight for class imbalance
+class_counts1 = table(data1$intervention.group)
+class_counts2 = table(data2$intervention.group)
+
+weights1 = c(1/class_counts1["Nonsurgical"], 1/class_counts1["Craniotomy/Craniectomy"])
+weights2 = c(1/class_counts2["Nonsurgical"], 1/class_counts2["Minimally Invasive Surgery"])
+
+weights1 = weights1 / sum(weights1)
+weights2 = weights2 / sum(weights2)
+```
+
+```{r}
+set.seed(2025)
+rf1 = randomForest(intervention.group ~ .,
+                  data = data1,
+                  ntree = 1000,
+                  replace = TRUE,
+                  nodesize = 10,
+                  classwt = weights1)
+
+rf2 = randomForest(intervention.group ~ .,
+                  data = data2,
+                  ntree = 1000,
+                  replace = TRUE,
+                  nodesize = 10,
+                  classwt = weights2)
+```
+
+```{r}
+predict1 = predict(rf1, type="prob")
+ids1 = as.numeric(patients1$X)
+
+predict1.df = as.data.frame(predict1) %>%
+  mutate(X = ids1)
+predict1.df = predict1.df %>% left_join(patients1)
+
+predict1.df %>%
+  filter(!is.na(intervention.group)) %>%
+  ggplot() +
+  aes(x = `Craniotomy/Craniectomy`,
+      fill = intervention.group) +
+  geom_histogram(binwidth = 0.05, position = "identity", alpha = 0.5) +
+  labs(title = "Distribution of Propensity Scores (Craniotomy/Craniectomy) Stratified by Intervention",
+       x = "Propensity Score (Craniotomy/Craniectomy)",
+       y = "Count",
+       fill = "Intervention")
+
+predict1.df %>%
+  filter(!is.na(intervention.group)) %>%
+  ggplot() +
+  aes(x = `Craniotomy/Craniectomy`,
+      fill = intervention.group) +
+  geom_histogram(alpha = 0.5,
+                 aes(y = ..density..),
+                 position = "identity") +
+  labs(title = "Density of Propensity Scores (Craniotomy/Craniectomy) Stratified by Intervention",
+       x = "Propensity Score (Craniotomy/Craniectomy)",
+       y = "Density",
+       fill = "Intervention")
+```
+
+```{r}
+pred1 = prediction(predict1[,2], data1$intervention.group)
+auc1 = performance(pred1, measure = "auc")@y.values[[1]]
+auc1
+```
+
+```{r}
+treat1 <- data1$intervention.group
+
+weights1 <- ifelse(treat1 == "Craniotomy/Craniectomy",
+                  1 / predict1[, 1],
+                  1 / (1 - predict1[, 1]))
+
+bal1 = bal.tab(intervention.group ~ age.at.admit + SpO2 + Respiratory.Rate +
+                gcs.initial + wbc + hemoglobin + platelet + hematocrit + INR +
+                PT + PTT + glucose + mean.airway.pressure + creatinine + sodium
+              + potassium + hypertension + heart.failure + anemia +
+                airway.obstruction + liver.disease + depressive.disorder
+              + subarachnoid,
+              data = data1,
+              weights = weights1,
+              method = "weighting",
+              un = TRUE)
+
+
+love.plot(bal1, estimand = "ATE", abs = TRUE, var.order = "adj", stars = "std",
+          title = "Covariate Balance (Craniotomy/Craniectomy and Nonsurgical)",
+          grid = FALSE, shapes = c(16, 17), colors = (c("red", "blue")),
+          thresholds = c(0.2))
+```
+
+```{r}
+table(data.frame(predict1)$Craniotomy.Craniectomy>0.05)/nrow(predict1)
+```
+
+```{r}
+predict2 = predict(rf2, type="prob")
+ids2 = as.numeric(patients2$X)
+
+predict2.df = as.data.frame(predict2) %>%
+  mutate(X = ids2)
+predict2.df = predict2.df %>% left_join(patients2)
+
+predict2.df %>%
+  filter(!is.na(intervention.group)) %>%
+  ggplot() +
+  aes(x = `Minimally Invasive Surgery`,
+      fill = intervention.group) +
+  geom_histogram(binwidth = 0.05, position = "identity", alpha = 0.5) +
+  labs(title = "Distribution of Propensity Scores (Minimally Invasive Surgery) Stratified by Intervention",
+       x = "Propensity Score (Minimally Invasive Surgery)",
+       y = "Count",
+       fill = "Intervention")
+
+predict2.df %>%
+  filter(!is.na(intervention.group)) %>%
+  ggplot() +
+  aes(x = `Minimally Invasive Surgery`,
+      fill = intervention.group) +
+  geom_histogram(alpha = 0.5,
+                 aes(y = ..density..),
+                 position = "identity") +
+  labs(title = "Density of Propensity Scores (Minimally Invasive Surgery) Stratified by Intervention",
+       x = "Propensity Score (Minimally Invasive Surgery)",
+       y = "Density",
+       fill = "Intervention")
+```
+
+```{r}
+pred2 = prediction(predict2[,2], data2$intervention.group)
+auc2 = performance(pred2, measure = "auc")@y.values[[1]]
+auc2
+```
+
+```{r}
+treat2 <- data2$intervention.group
+
+weights2 <- ifelse(treat2 == "Minimally Invasive Surgery",
+                  1 / predict2[, 1],
+                  1 / (1 - predict2[, 1]))
+
+bal2 = bal.tab(intervention.group ~ age.at.admit + SpO2 + Respiratory.Rate +
+                gcs.initial + wbc + hemoglobin + platelet + hematocrit + INR +
+                PT + PTT + glucose + mean.airway.pressure + creatinine + sodium
+              + potassium + hypertension + heart.failure + anemia +
+                airway.obstruction + liver.disease + depressive.disorder
+              + subarachnoid,
+              data = data2,
+              weights = weights2,
+              method = "weighting",
+              un = TRUE)
+
+
+love.plot(bal2, estimand = "ATE", abs = TRUE, var.order = "adj", stars = "std",
+          title = "Covariate Balance (Minimally Invasive Surgery and Nonsurgical)",
+          grid = TRUE, shapes = c(16, 17), colors = (c("red", "blue")),
+          thresholds = c(0.2))
+```
+
+```{r}
+table(data.frame(predict2)$Minimally.Invasive.Surgery>0.05)/nrow(predict2)
+```
+
+```{r}
+predict1full = predict(rf1, newdata = data, type="prob")
+predict2full = predict(rf2, newdata = data, type="prob")
+
+predict1full.df = as.data.frame(predict1full) %>% 
+  mutate(X = X.rows)
+predict1full.df = predict1full.df %>% 
+  left_join(patients)
+
+predict2full.df = as.data.frame(predict2full) %>% 
+  mutate(X = X.rows)
+predict2full.df = predict2full.df %>% 
+  left_join(patients)
+
+predictfull.df = full_join(predict1full.df, predict2full.df, by="X") %>% 
+  select(X, `Craniotomy/Craniectomy`, `Minimally Invasive Surgery`)
+
+write_csv(predictfull.df, "~/BDSI/Research/propensity_scores_rf.csv")
+```
