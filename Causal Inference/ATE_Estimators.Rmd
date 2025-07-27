@@ -99,17 +99,12 @@ full.data = full.data %>%
                                      "Craniotomy/Craniectomy", 1, 2)),
          survived = ifelse(died.before.90.days, 1, 0))
 
-# cranio = full.data %>% filter(treatment != 2)
-
 cranio = full.data %>% 
   mutate(aipw1 = cranio.outcome - nonsurg.outcome
          + ifelse(treatment == 1, 1, 0) / cranio.prop * (survived - cranio.outcome)
          - ifelse(treatment == 0, 1, 0) / (1 - cranio.prop) * (survived - nonsurg.outcome))
 
 ## Minimally Invasive Surgery
-
-# m.i.s = full.data %>% #filter(treatment != 1) %>%
-#   mutate(treatment = ifelse(treatment == 2, 1, treatment))
 
 m.i.s = full.data %>% 
   mutate(aipw2 = m.i.s.outcome - nonsurg.outcome
@@ -136,6 +131,7 @@ ate.aipw.results2
 ```
 
 ```{r}
+# "Robust" outcome model predictions to compare mortality rate
 robust.nonsurg.outcomes1 = full.data$nonsurg.outcome +
   (ifelse(full.data$treatment == 0, 1, 0) / 
    (1 - full.data$cranio.prop) * 
@@ -145,13 +141,11 @@ robust.nonsurg.outcomes2 = full.data$nonsurg.outcome +
   (ifelse(full.data$treatment == 0, 1, 0)/ 
    (1 - full.data$min.inv.surg.prop) * 
    (full.data$survived - full.data$nonsurg.outcome))
-
-# robust.nonsurg.outcomes1
-# robust.nonsurg.outcomes2
 ```
 
 
 ```{r}
+# Mortality rate rate calculation (before AIPW)
 total.mortality = outcomes %>% 
   filter(nonsurg.outcome == 1) %>% 
   nrow()
@@ -165,13 +159,5 @@ robust.nonsurg.outcomes1[robust.nonsurg.outcomes1 > 0.5] %>%
 
 robust.nonsurg.outcomes2[robust.nonsurg.outcomes2 > 0.5] %>% 
   length() / length(robust.nonsurg.outcomes2)
-```
-
-```{r}
-m.i.s %>% 
-  arrange(desc(aipw2))
-
-summary(cranio$aipw1)
-summary(m.i.s$aipw2)
 ```
 

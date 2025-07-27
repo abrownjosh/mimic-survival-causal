@@ -14,6 +14,7 @@ pacman::p_load(tidyverse, survival, survminer, ggplot2, dplyr, tidyr, readr,
 ```
 
 ```{r}
+# Read in imputed data and subset for binary treatments
 set.seed(2025)
 data = read.csv("~/BDSI/Research/imputed6.csv")
 
@@ -48,7 +49,7 @@ data2 = data %>%
 ```
 
 ```{r}
-# Logistic Regression
+# Logistic Regression (LASSO)
 library(glmnet)
 
 y1 = ifelse(data1$intervention.group == "Nonsurgical", 0, 1)
@@ -66,11 +67,13 @@ predict2 = predict(fit2, newx = x2, type = "response", s = lambda2)
 ```
 
 ```{r}
+# Selected variables by LASSO
 coef(fit1, fit1$lambda.1se)
 coef(fit2, fit2$lambda.1se)
 ```
 
 ```{r}
+# Propensity score predictions from LR
 predict.df1 = as.data.frame(predict1) %>% 
   mutate(X = patients1$X) %>% 
   rename(`Craniotomy/Craniectomy` = s0) %>% 
@@ -150,6 +153,7 @@ predict.df2 %>%
 ```
 
 ```{r}
+# Labels for love plots
 new_labels <- c(
   "age.at.admit*" = "Age*",
   "hemoglobin*" = "Hemoglobin",
@@ -180,6 +184,7 @@ new_labels <- c(
 
 
 ```{r}
+# Love plots
 treat1 <- data1$intervention.group
 
 weights1 <- ifelse(treat1 == "Craniotomy/Craniectomy",
@@ -276,6 +281,7 @@ lp2
 ```
 
 ```{r}
+# Overlap checking
 pred1 = prediction(predict1, y1)
 auc1 = performance(pred1, measure = "auc")@y.values[[1]]
 auc1
@@ -291,6 +297,7 @@ table(predict.df2$`Minimally Invasive Surgery` < 0.02 |
 ```
 
 ```{r}
+# Final predictions for LR
 x = model.matrix(intervention.group ~ . , data = data)[, -1]
 predict1full = predict(fit1, newx = x, type = "response", s = lambda1)
 predict2full = predict(fit2, newx = x, type = "response", s = lambda2)
@@ -314,6 +321,7 @@ write_csv(predictfull.df, "~/BDSI/Research/propensity_scores.csv")
 ```
 
 ```{r}
+# ===================== RANDOM FOREST ======================
 # Weight for class imbalance
 class_counts1 = table(data1$intervention.group)
 class_counts2 = table(data2$intervention.group)
@@ -326,6 +334,7 @@ weights2 = weights2 / sum(weights2)
 ```
 
 ```{r}
+# Train random forests
 set.seed(2025)
 rf1 = randomForest(intervention.group ~ .,
                   data = data1,
@@ -343,6 +352,7 @@ rf2 = randomForest(intervention.group ~ .,
 ```
 
 ```{r}
+# Initial propensity score predictions (Cranio vs. Nonsurg)
 predict1 = predict(rf1, type="prob")
 ids1 = as.numeric(patients1$X)
 
@@ -376,12 +386,14 @@ predict1.df %>%
 ```
 
 ```{r}
+# AUC (Cranio vs. Nonsurg)
 pred1 = prediction(predict1[,2], data1$intervention.group)
 auc1 = performance(pred1, measure = "auc")@y.values[[1]]
 auc1
 ```
 
 ```{r}
+# Love plot (Cranio vs. Nonsurg)
 treat1 <- data1$intervention.group
 
 weights1 <- ifelse(treat1 == "Craniotomy/Craniectomy",
@@ -407,10 +419,12 @@ love.plot(bal1, estimand = "ATE", abs = TRUE, var.order = "adj", stars = "std",
 ```
 
 ```{r}
+# Overlap (Cranio vs. Nonsurg)
 table(data.frame(predict1)$Craniotomy.Craniectomy>0.05)/nrow(predict1)
 ```
 
 ```{r}
+# Initial propensity score predictions (Minimally invasive vs. Nonsurg)
 predict2 = predict(rf2, type="prob")
 ids2 = as.numeric(patients2$X)
 
@@ -444,12 +458,14 @@ predict2.df %>%
 ```
 
 ```{r}
+# AUC (Minimally invasive vs. Nonsurg)
 pred2 = prediction(predict2[,2], data2$intervention.group)
 auc2 = performance(pred2, measure = "auc")@y.values[[1]]
 auc2
 ```
 
 ```{r}
+# Love plot (Minimally invasive vs. Nonsurg)
 treat2 <- data2$intervention.group
 
 weights2 <- ifelse(treat2 == "Minimally Invasive Surgery",
@@ -475,10 +491,12 @@ love.plot(bal2, estimand = "ATE", abs = TRUE, var.order = "adj", stars = "std",
 ```
 
 ```{r}
+# Overlap (Minimally invasive vs. Nonsurg)
 table(data.frame(predict2)$Minimally.Invasive.Surgery>0.05)/nrow(predict2)
 ```
 
 ```{r}
+# Final predictions (both binary cases)
 predict1full = predict(rf1, newdata = data, type="prob")
 predict2full = predict(rf2, newdata = data, type="prob")
 
