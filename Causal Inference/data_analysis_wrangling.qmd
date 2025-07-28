@@ -1,0 +1,668 @@
+---
+title: "Exploratory Data Analysis"
+format: html
+editor: visual
+---
+
+```{r}
+rm(list = ls())
+library(tidyverse)
+library(dplyr)
+library(readr)
+mydir = "~/BDSI/research_group/data"
+setwd(mydir)
+devtools::reload(pkgload::inst("dplyr"))
+```
+
+```{r}
+
+chart = read_csv("~/BDSI/research_group/data/chart_events_6_23.csv")
+comorbid = read_csv("~/BDSI/research_group/data/comorbidities_6_23.csv")
+proc = read_csv("~/BDSI/research_group/data/procedures_6_16.csv"
+)
+gcs_over_time = read_csv("~/BDSI/research_group/data/gcs_over_time_6_23.csv")
+rx = read_csv("~/BDSI/research_group/data/rx_6_16.csv
+")
+gcs = read_csv("~/BDSI/research_group/data/gcs_6_17.csv")
+```
+
+Run the below code to receive new code to contain variables of importance.
+
+```{r}
+comorbid = comorbid %>% 
+  #str_detect is a useful function. Look up it's documentation!
+  mutate(diabetes = str_detect(diagnosis.long, "diabetes"),
+         hypertension = str_detect(diagnosis.long, "hypertension"),
+         heart.failure = str_detect(diagnosis.long, "heart failure"),
+         kidney.disease = str_detect(diagnosis.long, "kidney disease"),
+         neoplasm = str_detect(diagnosis.long, "neoplasm"),
+         )
+
+comorbid = comorbid %>% 
+  group_by(subject_id) %>% 
+  mutate(diabetes = any(diabetes),
+         hypertension = any(hypertension),
+         heart.failure = any(heart.failure),
+         kidney.disease = any(kidney.disease))
+
+indicators = comorbid %>% 
+  select(subject_id, hadm_id, diabetes, hypertension, 
+         heart.failure, kidney.disease) %>% 
+  unique()
+
+# =====
+
+chart.with.indicators = chart %>% 
+  left_join(indicators, by = c("subject_id", "hadm_id"))
+
+chart.with.indicators = chart.with.indicators %>% 
+  mutate(dischtime = parse_date_time(dischtime, orders = c("ymd HMS", "ymd")),
+         admittime = parse_date_time(admittime, orders = c("ymd HMS", "ymd")),
+         dob = parse_date_time(dob, orders = c( "ymd")),
+         dod = parse_date_time(dod, orders = c( "ymd")),
+         los = as.numeric(difftime(dischtime, admittime, units = "days")))
+
+# ======
+
+chart.wide = chart.with.indicators %>% 
+  select( subject_id, hadm_id, gender, dischtime, admittime, dob, dod, los, dod_ssn,
+          diabetes, hypertension, heart.failure, kidney.disease, dod_hosp,
+          # your baseline variables of interest go here!
+          # selected from chart
+          marital_status, label, valuenum, intervention.group, ethnicity, diagnosis) %>% 
+  pivot_wider(names_from = label, values_from = valuenum, values_fill = NA, values_fn = ~first(.x))
+
+# =====
+
+chart.wide = chart.wide %>% 
+  mutate(died = !is.na(dod))
+
+chart.wide = chart.wide %>% 
+  mutate(days.after.death = difftime(dod, dischtime, unit="days"),
+         died.before.90.days = (days.after.death <= 90))
+
+
+chart.wide = chart.wide %>%
+  mutate(died.before.90.days = replace_na(died.before.90.days, FALSE))
+
+chart.wide = chart.wide %>% 
+  arrange(subject_id) %>% 
+  distinct(subject_id, .keep_all = T)
+
+chart.wide = chart.wide %>%
+  mutate(intervention.group = recode(intervention.group, 
+                                     "craniotomy/craniectomy" = "Craniotomy/Craniectomy",
+                                     "nonsurgical" = "Nonsurgical",
+                                     "minimally_invasive_surg" = "Minimally Invasive Surgery"))
+
+# Add age
+
+chart.wide = chart.wide %>%
+  left_join(chart %>% 
+              select(subject_id, age.at.admit) %>% 
+              distinct(subject_id, .keep_all = T), by = "subject_id")
+# Ethnicity
+
+chart.wide = chart.wide %>%
+  mutate(
+    asian = str_detect(ethnicity, "ASIAN"),
+    black = str_detect(ethnicity, "BLACK"),
+    white = str_detect(ethnicity, "WHITE"),
+    hispanic = str_detect(ethnicity, "HISPANIC"),
+    ethnicity.missing = ifelse(
+      is.na(ethnicity) | str_detect(toupper(ethnicity), "DECLINED|UNABLE|UNKNOWN"),
+      TRUE, FALSE
+    ),
+    other.ethnicity = case_when(
+      asian | black | white | hispanic | ethnicity.missing ~ FALSE,
+      TRUE ~ TRUE
+    )
+  )
+
+# Intracranial
+
+chart.wide = chart.wide %>% 
+  mutate(intracranial = str_detect(diagnosis, "INTRACRANIAL"))
+
+chart.wide = chart.wide %>% 
+  mutate(subarachnoid = str_detect(diagnosis, "SAH") | str_detect(diagnosis, "SUBARACHNOID"),
+         subdural = str_detect(diagnosis, "SUBDURAL"),
+         intraparenchymal = str_detect(diagnosis, "INTRAPARENCHYMAL") | str_detect(diagnosis, "INTRAPARANCHYMAL")) %>%
+  mutate(intracranial.combined = intracranial | subarachnoid | subdural | intraparenchymal)
+
+# More comorbidities
+
+total.diagnosis = comorbid %>% 
+  group_by(subject_id) %>%
+  summarise(total.diagnosis = paste(unique(diagnosis.long), collapse = ", ")) %>% 
+  mutate(hypothyroidism = str_detect(total.diagnosis, "hypothyroidism"),
+         #kidney.disease = str_detect(total.diagnosis, "kidney disease"),
+         anemia = str_detect(total.diagnosis, "anemia"),
+         airway.obstruction = str_detect(total.diagnosis, "airway obstruction"),
+         liver.disease = str_detect(total.diagnosis, "cirrhosis"),
+         depressive.disorder= str_detect(total.diagnosis, "depressive")
+         )
+
+chart.wide = chart.wide %>% 
+  left_join(total.diagnosis, by = "subject_id")
+
+# gcs scores
+
+gcs.unique = gcs_over_time %>% group_by(subject_id) %>%
+  arrange(charttime)%>%
+  filter(row_number()== 1) 
+  
+initial_gcs = gcs.unique %>%
+  arrange(subject_id, charttime) %>%
+  select(subject_id, hadm_id, valuenum)
+
+initial_gcs = rename(initial_gcs, gcs.initial = valuenum)
+  
+chart.wide = chart.wide %>%
+  left_join(initial_gcs, by = c("subject_id", "hadm_id"))
+
+
+# Emergency Room
+
+chart.wide = chart.wide %>% 
+  left_join(
+    gcs_over_time %>% select(subject_id, admission_location) %>% distinct(),
+    by = "subject_id"
+  ) %>% 
+  mutate(clinic.loc = str_detect(admission_location, "CLINIC"),
+         emergency.loc = str_detect(admission_location, "EMERGENCY"),
+         other.loc = case_when(
+          emergency.loc | clinic.loc | NA ~ FALSE,
+          TRUE ~ TRUE
+    )
+  )
+
+chart.wide = chart.wide %>% 
+  rename(wbc = `WBC (4-11,000)`, hemoglobin = Hemoglobin, platelet = `Platelet Count`, hematocrit = Hematocrit, glucose = Glucose, mean.airway.pressure = `Mean Airway Pressure`, creatinine = Creatinine, sodium = `Sodium (serum)`, potassium = `Potassium (serum)`)
+chart.new = chart.wide %>% 
+  distinct(subject_id, .keep_all = T) %>% 
+  select(age.at.admit, SpO2, `Respiratory Rate`, gcs.initial, 
+         gender, intervention.group, `wbc`, hemoglobin, platelet, hematocrit, INR,          PT, PTT, glucose, mean.airway.pressure, creatinine, sodium, potassium,            died.before.90.days, asian, black, white, hispanic, 
+         other.ethnicity,clinic.loc, emergency.loc, other.loc, diabetes,                    hypertension, heart.failure, kidney.disease, hypothyroidism, anemia,               airway.obstruction, liver.disease, depressive.disorder,                            intracranial, subarachnoid, subdural, intraparenchymal, 
+         intracranial.combined
+         )
+
+# change people with age > 200 to 100
+chart.new = chart.new %>%
+  mutate(age.at.admit = replace(age.at.admit, age.at.admit > 110, 100))
+  
+write.csv(chart.new, "C:/Users/kwokr/OneDrive/JHU/Y1/BDSI/research_group/data/chart_cleaned.csv" )
+
+```
+
+```{r}
+summary(chart.new)
+```
+
+Code to add the age.at.admit column into chart.wide:
+
+```{r}
+chart.wide = chart.wide %>%
+  left_join(chart %>% 
+              select(subject_id, age.at.admit) %>% 
+              distinct(subject_id, .keep_all = T), by = "subject_id")
+```
+
+```{r}
+chart.wide %>% 
+  filter(age.at.admit < 200) %>% 
+  ggplot(aes(x = age.at.admit, y = died.before.90.days)) +
+  geom_boxplot() + 
+  labs(
+    title = "Mortality Within 90 Days Across Age Groups",
+    x = "Age at Admit",
+    y = "90 Day Mortality"
+  )
+
+```
+
+```{r}
+chart.wide %>% 
+  filter(age.at.admit < 200) %>% 
+  ggplot(aes(x = age.at.admit, fill = died.before.90.days)) +
+  geom_histogram(alpha = 0.5) +
+  labs(
+    title = "Mortality Within 90 Days Across Age Groups",
+    x = "Age at Admit",
+    fill = "Died before 90 Days"
+  )
+
+```
+
+```{r}
+chart.wide %>% 
+  filter(age.at.admit < 200) %>% 
+  ggplot(aes(x = age.at.admit, fill = died.before.90.days)) +
+  geom_density(alpha = 0.5) +
+  labs(
+    title = "Mortality within 90 Days Across Age Groups",
+    x = "Age at Admit",
+    y = "Density",
+    fill = "90-day Mortality"
+  ) + 
+  facet_wrap(vars(intervention.group))
+```
+
+Hypertension against died.before.90.days
+
+Code to combine hypertension and died.before.90.days columns together then finding their percentages
+
+```{r}
+# NOT NEEDED
+died = chart.wide %>% 
+  select(subject_id, died.before.90.days)
+hypertension = comorbid %>% 
+  select(subject_id, hypertension) %>% 
+  distinct(subject_id, .keep_all = T)
+
+hyper_died = died %>% 
+  left_join(hypertension, by = "subject_id") %>%
+  filter(!is.na(hypertension)) 
+hyper_died
+```
+
+```{r}
+chart.wide %>%
+  filter(!is.na(hypertension)) %>%
+  ggplot(aes(x = hypertension, fill = died.before.90.days)) +
+    geom_bar(position = "dodge") +
+    labs(
+      x = "Hypertension",
+      y = "Count",
+      title = "Mortality vs. Hypertension Stratified by Treatment",
+      fill = "90-day Mortality"
+    ) + facet_wrap(vars(intervention.group)) +
+    scale_x_discrete(labels=c("NO", "YES"))
+```
+
+```{r}
+chart.wide %>%
+  filter(!is.na(hypertension)) %>%
+  ggplot(aes(x = hypertension, fill = died.before.90.days)) +
+    geom_bar(position = "fill") +
+    labs(
+      x = "Has Hypertension",
+      y = "90 Day Mortality",
+      title = "Mortality by Hypertension Status",
+      fill = "Died before 90 days"
+    )
+```
+
+```{r}
+chart.wide %>%
+  filter(!is.na(hypertension)) %>%
+  ggplot(aes(x = hypertension, fill = died.before.90.days)) +
+    geom_bar(position = "fill") +
+    labs(
+      x = "Has Hypertension",
+      y = "90 Day Mortality",
+      title = "Mortality by Hypertension Status",
+      fill = "Died before 90 days"
+    ) + 
+  facet_wrap(vars(intervention.group))
+```
+
+Calculate percentages:
+
+```{r}
+chart.wide %>% 
+  select(died.before.90.days, hypertension) %>% 
+  group_by(hypertension) %>%
+  summarise(count = n(), death.count = sum(died.before.90.days)) %>% 
+  mutate(death.rate = death.count / count, survival.rate = 1 - death.rate) 
+  
+```
+
+Heart Failure
+
+```{r}
+
+# NOT NEEDED DO NOT RUN
+heart.fail = comorbid %>% 
+  select(subject_id, heart.failure) %>% 
+  distinct(subject_id, .keep_all = T)
+
+heart.fail = heart.fail %>% 
+  left_join(died, by = "subject_id") 
+```
+
+```{r}
+chart.wide %>% 
+  filter(!is.na(heart.failure)) %>% 
+  ggplot(aes(x = heart.failure, fill = died.before.90.days)) +
+    geom_bar(position = "dodge") +
+    labs(
+      x = "Heart Failure",
+      y = "Count",
+      title = "Mortality vs. Heart Failure Stratified by Treatment",
+      fill = "90-day Mortality"
+    ) + facet_wrap(vars(intervention.group)) +
+  scale_x_discrete(labels=c("NO", "YES"))
+```
+
+```{r}
+chart.wide %>% 
+  filter(!is.na(heart.failure)) %>% 
+  ggplot(aes(x = heart.failure, fill = died.before.90.days)) +
+    geom_bar(position = "fill") +
+    labs(
+      x = "Has Heart Failure",
+      y = "90 Day Mortality",
+      title = "Mortality against Heart Failure",
+      fill = "Died before 90 days"
+    ) +
+  facet_wrap(vars(intervention.group))
+```
+
+```{r}
+chart.wide %>% 
+  filter(!is.na(heart.failure)) %>% 
+  ggplot(aes(x = heart.failure, fill = died.before.90.days)) +
+    geom_bar(position = "fill") +
+    labs(
+      x = "Has Heart Failure",
+      y = "90 Day Mortality",
+      title = "Mortality against Heart Failure",
+      fill = "Died before 90 days"
+    )
+```
+
+Code to check percentages to see if there is a noticeable difference in distribution of patients with or without comorbidities.
+
+```{r}
+chart.wide %>%
+  select(died.before.90.days, heart.failure) %>% 
+  group_by(heart.failure) %>%
+  summarise(count = n(), death.count = sum(died.before.90.days)) %>% 
+  mutate(death.rate = death.count / count, survival.rate = 1 - death.rate) 
+
+```
+
+Diabetes
+
+```{r}
+
+chart.wide %>% 
+  filter(!is.na(diabetes)) %>% 
+  ggplot(aes(x = diabetes, fill = died.before.90.days)) +
+    geom_bar(position = "fill") +
+    labs(
+      x = "Diabetes",
+      y = "Count",
+      title = "Mortality vs. Diabetes Stratified by Treatmnt",
+      fill = "Died before 90 days"
+    )
+```
+
+```{r}
+chart.wide %>% 
+  filter(!is.na(diabetes)) %>% 
+  ggplot(aes(x = diabetes, fill = died.before.90.days)) +
+    geom_bar(position = "dodge") +
+    labs(
+      x = "Diabetes",
+      y = "Count",
+      title = "Mortality vs. Diabetes Stratified by Treatment",
+      fill = "90-day Mortality"
+    ) +
+  facet_wrap(vars(intervention.group)) +
+  scale_x_discrete(labels = c(`FALSE` = "NO", `TRUE` = "YES"))
+```
+
+```{r}
+chart.wide %>%
+  select(died.before.90.days, diabetes) %>% 
+  group_by(diabetes) %>%
+  summarise(count = n(), death.count = sum(died.before.90.days)) %>% 
+  mutate(death.rate = death.count / count, survival.rate = 1 - death.rate) 
+```
+
+```{r}
+chart.wide %>% 
+  filter(!is.na(heart.failure)) %>% 
+  ggplot(aes(x = heart.failure, fill = died.before.90.days)) +
+    geom_bar(position = "dodge") +
+    labs(
+      x = "Has Heart Failure",
+      y = "90 Day Mortality",
+      title = "Mortality against Heart Failure",
+      fill = "Died before 90 days"
+    )
+```
+
+Attempt to make proportions for every comorbidity:
+
+```{r}
+c = ungroup(comorbid) %>% 
+  select(diagnosis.short) %>% 
+  distinct()
+com = c$diagnosis.short
+
+```
+
+Function to output
+
+```{r}
+
+library(stringr)
+library(rlang)
+
+output_proportion <- function(name) {
+  colname <- gsub(" ", "_", name)  
+
+  comorbid_flagged <- comorbid %>%
+    mutate(temp_flag = str_detect(diagnosis.long, name)) %>%
+    group_by(subject_id) %>%
+    mutate(temp_flag = any(temp_flag)) %>%
+    ungroup()
+
+  indicate <- comorbid_flagged %>%
+    select(subject_id, temp_flag) %>%
+    distinct()
+
+  chart_with_flag <- chart.wide %>%
+    left_join(indicate, by = "subject_id")
+
+  chart_with_flag %>%
+    select(died.before.90.days, temp_flag) %>%
+    group_by(temp_flag) %>%
+    summarise(count = n(), death.count = sum(died.before.90.days), .groups = "drop") %>%
+    mutate(death.rate = death.count / count, survival.rate = 1 - death.rate)
+  
+  return(chart_with_flag)
+}
+
+values = output_proportion("kidney disease")
+view(values)
+```
+
+```{r}
+output_proportion("kidney disease")
+```
+
+Kidney Disease Graph
+
+```{r}
+chart.wide %>% 
+  filter(!is.na(kidney.disease)) %>% 
+  ggplot(aes(x = kidney.disease, fill = died.before.90.days)) + 
+  geom_bar(position = "dodge") +
+  labs(
+    x = "Kidney Disease",
+    y = "Count",
+    title = "Mortality vs. Kidney Disease Stratified by Treatment",
+    fill = "90-day Mortality"
+  ) + 
+  facet_wrap(vars(intervention.group)) +
+  scale_x_discrete(labels = c(`FALSE` = "NO", `TRUE` = "YES"))
+```
+
+Heart Rate
+
+```{r}
+library(tidyverse)
+library(purrr)
+
+chart.wide <- chart.wide %>%
+  mutate(avg.heart.rate = map_dbl(`Heart Rate`, ~ {
+    if (is.numeric(.x)) {
+      if (length(.x) > 1) mean(.x, na.rm = TRUE) else .x
+    } else {
+      NA_real_
+    }
+  })) %>% 
+  filter(!is.na(`Heart Rate`))
+
+chart.wide %>% 
+  ggplot(aes(x = avg.heart.rate, fill = died.before.90.days)) +
+  geom_density(alpha = 0.5) +
+  labs(
+    title = "Mortality within 90 Days vs. Average Heart Rate",
+    x = "Average Heart Rate",
+    y = "Density",
+    fill = "90-day Mortality"
+  ) + 
+  facet_wrap(vars(intervention.group))
+```
+
+```{r}
+location = gcs_over_time %>% 
+  select(subject_id, admission_location) %>% 
+  distinct(subject_id, .keep_all = T)
+
+location = location %>% 
+  full_join(died)
+chart.wide %>%
+  full_join(location) %>% 
+  filter(!is.na(died.before.90.days), !is.na(admission_location)) %>%
+  ggplot(aes(y = admission_location, fill = died.before.90.days)) +
+  geom_bar() +
+  facet_wrap(vars(intervention.group))
+
+```
+
+```{r}
+chart.wide %>% 
+  group_by(ethnicity) %>% 
+  summarise(num = n())
+```
+
+```{r}
+location = gcs_over_time %>% 
+  select(subject_id, admission_location) %>% 
+  distinct(subject_id, .keep_all = T)
+
+location = location %>% 
+  full_join(died)
+chart.wide %>%
+  full_join(location) %>% 
+  filter(!is.na(died.before.90.days), !is.na(admission_location)) %>%
+  group_by(admission_location) %>% 
+  summarise(num = n())
+```
+
+To get Ethnicity Indicator:
+
+```{r}
+chart.wide = chart.wide %>%
+  mutate(
+    asian = str_detect(ethnicity, "ASIAN"),
+    black = str_detect(ethnicity, "BLACK"),
+    white = str_detect(ethnicity, "WHITE"),
+    hispanic = str_detect(ethnicity, "HISPANIC"),
+    ethnicity.missing = ifelse(
+      is.na(ethnicity) | str_detect(toupper(ethnicity), "DECLINED|UNABLE|UNKNOWN"),
+      TRUE, FALSE
+    ),
+    other.ethnicity = case_when(
+      asian | black | white | hispanic | ethnicity.missing ~ FALSE,
+      TRUE ~ TRUE
+    )
+  )
+```
+
+Emergency Room Indicator:
+
+```{r}
+chart.wide = chart.wide %>% 
+  left_join(
+    gcs_over_time %>% select(subject_id, admission_location) %>% distinct(),
+    by = "subject_id"
+  ) %>% 
+  mutate(clinic.loc = str_detect(admission_location, "CLINIC"),
+         emergency.loc = str_detect(admission_location, "EMERGENCY"),
+         other.loc = case_when(
+          emergency.loc | clinic.loc | NA ~ FALSE,
+          TRUE ~ TRUE
+    )
+  )
+```
+
+Initial GCS Scores
+
+```{r}
+gcs.unique = gcs_over_time %>% group_by(subject_id) %>%
+  arrange(charttime)%>%
+  filter(row_number()== 1) 
+  
+
+initial_gcs <- gcs.unique %>%
+  arrange(subject_id, charttime) %>%
+  group_by(subject_id)
+  
+gcs.unique = gcs.time %>% group_by(subject_id) %>%
+  arrange(charttime)%>%
+  filter(row_number()== 1) 
+  
+initial_gcs = gcs.unique %>%
+  arrange(subject_id, charttime) %>%
+  select(subject_id, hadm_id, valuenum)
+
+initial_gcs = rename(initial_gcs, gcs.initial = valuenum)
+  
+chart.wide = chart.wide %>%
+  left_join(initial_gcs, by = c("subject_id", "hadm_id"))
+```
+
+Intracranial
+
+```{r}
+chart.wide = chart.wide %>% 
+  mutate(intracranial = str_detect(diagnosis, "INTRACRANIAL"))
+
+chart.wide = chart.wide %>% 
+  mutate(subarachnoid = str_detect(diagnosis, "SAH") | str_detect(diagnosis, "SUBARACHNOID"),
+         subdural = str_detect(diagnosis, "SUBDURAL"),
+         intraparenchymal = str_detect(diagnosis, "INTRAPARENCHYMAL") | str_detect(diagnosis, "INTRAPARANCHYMAL")) %>%
+  mutate(intracranial.combined = intracranial | subarachnoid | subdural | intraparenchymal)
+
+chart.wide %>% filter(intracranial.combined == TRUE) %>% 
+  select(subject_id, diagnosis, intracranial.combined, intracranial, subarachnoid, subdural, intraparenchymal)
+
+```
+
+```{r}
+total.diagnosis = comorbid %>% 
+  group_by(subject_id) %>%
+  summarise(total.diagnosis = paste(unique(diagnosis.long), collapse = ", ")) %>% 
+  mutate(hypothyroidism = str_detect(total.diagnosis, "hypothyroidism"),
+         kidney.disease = str_detect(total.diagnosis, "kidney disease"),
+         anemia = str_detect(total.diagnosis, "anemia"),
+         airway.obstruction = str_detect(total.diagnosis, "airway obstruction"),
+         liver.disease = str_detect(total.diagnosis, "cirrhosis")
+         )
+
+chart.wide = chart.wide %>% 
+  left_join(total.diagnosis, by = "subject_id")
+```
+
+```{r}
+chart.wide %>% 
+  filter(!is.na(`Ventilator Type`)) %>% 
+  nrow()
+```
