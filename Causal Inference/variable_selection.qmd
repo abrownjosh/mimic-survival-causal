@@ -1,0 +1,95 @@
+---
+title: "Variable Selection"
+format: html
+editor: visual
+---
+
+## Variable Selection
+
+Library and file loading:
+
+```{r}
+library(Matrix)
+library(glmnet)
+library(pROC)
+library(caret)
+library(tidyverse)
+
+rm(list = ls())
+mydir = "~/BDSI/research_group/data"
+setwd(mydir) 
+
+data1 = read.csv("imputed6.csv")
+data1$X = NULL
+data1$intervention.group = NULL
+```
+
+```{r}
+
+data1$died.before.90.days = as.numeric(data1$died.before.90.days)
+
+# Set seed and split into training and test 
+set.seed(2025)
+index = sample(nrow(data1), floor(0.8 * nrow(data1)))
+train = data1[index, ]
+test = data1[-index, ]
+
+
+train_sparse = sparse.model.matrix(died.before.90.days ~ . , data = train)[,-1]
+test_sparse = sparse.model.matrix(died.before.90.days ~ . , data = test)[,-1]
+
+
+```
+
+Train the model:
+
+```{r}
+glmmod = glmnet(x = train_sparse, y = train$died.before.90.days, alpha = 1, family = "binomial")
+plot(glmmod, xvar = "lambda")
+glmmod
+
+coef(glmmod)[, 69]
+
+cv.glmmod = cv.glmnet(x = train_sparse, y = train$died.before.90.days, alpha = 1, family = "binomial")
+plot(cv.glmmod)
+
+lambda = cv.glmmod$lambda.1se
+lambda
+
+coefs = as.matrix(coef(cv.glmmod, s = "lambda.1se"))
+ix = which(abs(coefs[, 1]) > 0)
+length(ix)
+
+coefs[ix, 1, drop = FALSE]
+
+test$cv.glmmod = predict(cv.glmmod, newx = test_sparse, type = "response", s = lambda)
+
+best.lambda = cv.glmmod$lambda.min
+best.lambda
+```
+
+Predict Test Set
+
+```{r}
+pred_lasso = predict(cv.glmmod, newx = test_sparse, type = "response", s = best.lambda)
+pred_lasso
+
+new_pred_lasso = ifelse(pred_lasso >= 0.5, 1, 0)
+new_pred_lasso = data.frame(new_pred_lasso)
+data_lasso = cbind(test$died.before.90.days, new_pred_lasso)
+names(data_lasso) = c("actual", "pred")
+xtab_lasso = table(data_lasso$actual, data_lasso$pred)
+
+cm_lasso = confusionMatrix(xtab_lasso)
+overall_accuracy_lasso = cm_lasso$overall['Accuracy']
+
+```
+
+Output results
+
+```{r}
+lambda = cv.glmmod$lambda.1se
+coefs = as.matrix(coef(cv.glmmod, s = lambda))
+ix = which(abs(coefs[, 1]) > 0)
+print(coefs[ix, 1, drop = FALSE])
+```
