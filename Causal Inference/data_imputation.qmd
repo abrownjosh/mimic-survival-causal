@@ -1,0 +1,171 @@
+---
+title: "Data Imputation"
+format: html
+editor: visual
+---
+
+## Imputation Trial #1: 
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE)
+
+# Clear the environment and load packages
+rm(list = ls())
+pacman::p_load(tidyverse, mice, mitools, missForest)
+
+# Set directory for easy data access
+mydir = "~BDSI/research_group/data"
+setwd(mydir)
+
+chart.new = read.csv("chart_cleaned.csv")
+```
+
+Check if first column is X
+
+```{r}
+chart.new$X = NULL
+```
+
+Change categorical variables into factors because we don't want them to be treated as continuous.
+
+```{r}
+chart.new = chart.new %>% 
+  mutate_if(is.logical, as.factor)
+
+chart.new = chart.new %>% 
+  mutate(gender = factor(gender),
+         intervention.group = factor(intervention.group))
+```
+
+Now, we will set up an initial version of the imputation. `n.imp` represents how many data sets you want to make, or, in other words, how many different plausible guesses for your values. `maxit = 1` limits the number of chaining to just 1 round.
+
+```{r}
+map = make.method(chart.new)
+
+# Change the numeric method to be pnm
+map[sapply(chart.new, is.numeric)] = "pmm"
+
+# Change the binary categorical varibles to pmm
+map[sapply(chart.new, function(x) is.factor(x) && nlevels(x) == 2)] = "logreg.boot"
+
+# Change other categorical variables to polyreg
+map[sapply(chart.new, function(x) is.factor(x) && nlevels(x) > 2)] = "polyreg"
+
+
+```
+
+Test imputation with one iteration, must run:
+
+```{r}
+impm1 = mice(chart.new, method = map, n.imp = 5, seed = 2025, maxit = 3)
+```
+
+Look at convergence metric: values are ideally below 1.10.
+
+```{r}
+test = convergence(impm1)
+test %>%
+  filter(!is.na(psrf)) %>%
+  group_by(vrb) %>%
+  summarise(avg_psrf = mean(psrf, na.rm = TRUE)) %>%
+  arrange(desc(avg_psrf)) %>% 
+  mutate(above = ifelse(avg_psrf > 1.10, 1, 0))
+```
+
+## Imputation Trial #2
+
+Start with 0 `maxit` this time:
+
+```{r}
+impm1 = mice(chart.new, method = map, seed = 2025, maxit=0)
+```
+
+So, you want to exclude the treatment and the outcome to prevent any sort of leakage or bias in our imputation. Since everything else is pre-treatment, it should be okay to keep.
+
+```{r}
+pred = impm1$predictorMatrix
+keep_vars <- c("age.at.admit", "gcs.initial", "platelet", "hematocrit", "glucose", "creatinine", "sodium", "potassium", "diabetes", "anemia", "liver.disease", "depressive.disorder", "intraparenchymal", "wbc")
+pred[, !(colnames(pred) %in% keep_vars)] = 0
+```
+
+Now, we want to run the mice package on our data officially:
+
+```{r}
+impm2 = mice(chart.new, method = map, pred = pred, n.imp = 5, seed = 2025, maxit = 100)
+```
+
+Check convergence:
+
+```{r}
+data = convergence(impm2)
+data %>%
+  filter(!is.na(psrf)) %>%
+  group_by(vrb) %>%
+  summarise(avg_psrf = mean(psrf, na.rm = TRUE)) %>%
+  arrange(desc(avg_psrf)) %>% 
+  mutate(above = ifelse(avg_psrf > 1.10, 1, 0))
+```
+
+Now, we want to stack the imputed values into a new data frame. Essentially, we are creating a new data frame with the imputed data.
+
+```{r}
+longm1 = complete(impm2, action = "long", include = TRUE)
+
+```
+
+```{r}
+impm1a = as.mids(longm1)
+mice.imp2 = lapply(seq(impm1a$m), function(im) complete(impm1a, im))
+mice.imp2 = imputationList(mice.imp2)
+```
+
+Look at one of the datasets (5 total)
+
+```{r}
+df1 = mice.imp2$imputations[[2]]
+df1$X = NULL
+summary(df1)     
+write.csv(df1, "~BDSI/research_group/week3/imputed5.csv")
+```
+
+```{r}
+df2 = mice.imp2$imputations[[2]]
+summary(df2)        
+  
+```
+
+```{r}
+library(ggplot2)
+chart.new %>% 
+  filter(age.at.admit >= 100) %>% 
+  ggplot(aes(x = age.at.admit, fill = died.before.90.days)) +
+  geom_histogram() +
+  facet_wrap(vars(intervention.group))
+```
+
+## Imputation Trial 3:
+
+Using forests for Imputation:
+
+```{r}
+imputed = missForest(chart.new)
+```
+
+Access the imputed dataset:
+
+```{r}
+imputed_data = imputed$ximp
+summary(imputed_data)
+```
+
+Check for error:
+
+```{r}
+imputed$OOBerror
+```
+
+Write it in:
+
+```{r}
+write.csv(imputed_data, "~BDSI/research_group/data/imputed6.csv")
+```
